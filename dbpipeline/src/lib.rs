@@ -47,6 +47,8 @@ pub const CHUNK_SLOT_SIZE: usize = 4 + CHUNK_SIZE;
 pub const CHUNK_CUCKOO_HEADER_SIZE: usize = 32;
 pub const CHUNK_CUCKOO_MAGIC: u64 = 0xBA7C_C000_C000_0002;
 pub const LEGACY_CHUNK_MASTER_SEED: u64 = 0xa3f7c2d918e4b065;
+pub const CHAIN_ANCHOR_BYTES: usize = 36;
+pub const ANCHOR_MAGIC_SNAPSHOT_XOR: u64 = 0x0000_0001_0000_0000;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
@@ -169,6 +171,7 @@ pub struct UtxoChunkBuildReport {
 pub struct IndexCuckooOptions {
     pub master_seed: u64,
     pub tag_seed: u64,
+    pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
 }
 
 impl Default for IndexCuckooOptions {
@@ -176,6 +179,7 @@ impl Default for IndexCuckooOptions {
         Self {
             master_seed: LEGACY_INDEX_MASTER_SEED,
             tag_seed: LEGACY_INDEX_TAG_SEED,
+            snapshot_anchor: None,
         }
     }
 }
@@ -192,12 +196,14 @@ pub struct IndexCuckooBuildReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkCuckooOptions {
     pub master_seed: u64,
+    pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
 }
 
 impl Default for ChunkCuckooOptions {
     fn default() -> Self {
         Self {
             master_seed: LEGACY_CHUNK_MASTER_SEED,
+            snapshot_anchor: None,
         }
     }
 }
@@ -418,8 +424,8 @@ fn build_index_cuckoo_inner(
     }
     writer.flush()?;
 
-    let output_bytes =
-        INDEX_CUCKOO_HEADER_SIZE as u64 + (INDEX_K * slots_per_table * INDEX_SLOT_SIZE) as u64;
+    let output_bytes = index_cuckoo_header_size(options) as u64
+        + (INDEX_K * slots_per_table * INDEX_SLOT_SIZE) as u64;
     Ok(IndexCuckooBuildReport {
         index_entries: n as u64,
         bins_per_table: bins_per_table as u32,
@@ -522,8 +528,8 @@ fn build_chunk_cuckoo_inner(
     }
     writer.flush()?;
 
-    let output_bytes =
-        CHUNK_CUCKOO_HEADER_SIZE as u64 + (CHUNK_K * slots_per_table * CHUNK_SLOT_SIZE) as u64;
+    let output_bytes = chunk_cuckoo_header_size(options) as u64
+        + (CHUNK_K * slots_per_table * CHUNK_SLOT_SIZE) as u64;
     Ok(ChunkCuckooBuildReport {
         chunks: n as u64,
         bins_per_table: bins_per_table as u32,
@@ -687,13 +693,17 @@ fn write_index_cuckoo_header<W: Write>(
     bins_per_table: u32,
     options: &IndexCuckooOptions,
 ) -> Result<(), PipelineError> {
-    writer.write_all(&INDEX_CUCKOO_MAGIC.to_le_bytes())?;
+    let magic = cuckoo_magic(INDEX_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
     writer.write_all(&(INDEX_SLOTS_PER_BIN as u32).to_le_bytes())?;
     writer.write_all(&bins_per_table.to_le_bytes())?;
     writer.write_all(&(INDEX_PBC_HASHES as u32).to_le_bytes())?;
     writer.write_all(&options.master_seed.to_le_bytes())?;
     writer.write_all(&options.tag_seed.to_le_bytes())?;
+    if let Some(anchor) = options.snapshot_anchor {
+        writer.write_all(&anchor)?;
+    }
     Ok(())
 }
 
@@ -702,13 +712,33 @@ fn write_chunk_cuckoo_header<W: Write>(
     bins_per_table: u32,
     options: &ChunkCuckooOptions,
 ) -> Result<(), PipelineError> {
-    writer.write_all(&CHUNK_CUCKOO_MAGIC.to_le_bytes())?;
+    let magic = cuckoo_magic(CHUNK_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(CHUNK_K as u32).to_le_bytes())?;
     writer.write_all(&(CHUNK_SLOTS_PER_BIN as u32).to_le_bytes())?;
     writer.write_all(&bins_per_table.to_le_bytes())?;
     writer.write_all(&(CHUNK_PBC_HASHES as u32).to_le_bytes())?;
     writer.write_all(&options.master_seed.to_le_bytes())?;
+    if let Some(anchor) = options.snapshot_anchor {
+        writer.write_all(&anchor)?;
+    }
     Ok(())
+}
+
+fn index_cuckoo_header_size(options: &IndexCuckooOptions) -> usize {
+    INDEX_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES)
+}
+
+fn chunk_cuckoo_header_size(options: &ChunkCuckooOptions) -> usize {
+    CHUNK_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES)
+}
+
+fn cuckoo_magic(legacy_magic: u64, has_snapshot_anchor: bool) -> u64 {
+    if has_snapshot_anchor {
+        legacy_magic ^ ANCHOR_MAGIC_SNAPSHOT_XOR
+    } else {
+        legacy_magic
+    }
 }
 
 fn write_index_entry<W: Write>(
@@ -1076,8 +1106,12 @@ mod tests {
     fn regtest_chunk_build_is_deterministic() {
         let dir = fresh_temp_dir("chunk-determinism");
         let flat = dir.join("utxo_set.bin");
-        utxosnapshot::materialize_flat_utxo_set(REGTEST_FIXTURE, &flat, REGTEST_MUHASH)
-            .expect("materialize flat fixture");
+        let flat_report =
+            utxosnapshot::materialize_flat_utxo_set(REGTEST_FIXTURE, &flat, REGTEST_MUHASH)
+                .expect("materialize flat fixture");
+        let mut regtest_anchor = [0u8; CHAIN_ANCHOR_BYTES];
+        regtest_anchor[..32].copy_from_slice(&flat_report.header.base_hash);
+        regtest_anchor[32..].copy_from_slice(&111u32.to_le_bytes());
 
         let out1 = dir.join("out1");
         let out2 = dir.join("out2");
@@ -1153,6 +1187,38 @@ mod tests {
             LEGACY_INDEX_TAG_SEED
         );
 
+        let anchored_index_cuckoo = dir.join("index-cuckoo-anchored.bin");
+        let anchored_index_report = build_index_cuckoo(
+            out1.join(UTXO_CHUNKS_INDEX_FILENAME),
+            &anchored_index_cuckoo,
+            &IndexCuckooOptions {
+                master_seed: 0xf5c3_6b45_6159_d686,
+                tag_seed: 0x0c65_b3f4_e239_2919,
+                snapshot_anchor: Some(regtest_anchor),
+            },
+        )
+        .expect("build anchored index cuckoo");
+        assert_eq!(
+            anchored_index_report,
+            IndexCuckooBuildReport {
+                index_entries: 9,
+                bins_per_table: 1,
+                slots_per_table: 4,
+                output_bytes: 3_976,
+                total_placements: 27,
+            }
+        );
+        let anchored_index_bytes = std::fs::read(&anchored_index_cuckoo).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(anchored_index_bytes[0..8].try_into().unwrap()),
+            INDEX_CUCKOO_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR
+        );
+        assert_eq!(
+            &anchored_index_bytes
+                [INDEX_CUCKOO_HEADER_SIZE..INDEX_CUCKOO_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
+            &regtest_anchor
+        );
+
         let chunk_cuckoo1 = dir.join("chunk-cuckoo-1.bin");
         let chunk_cuckoo2 = dir.join("chunk-cuckoo-2.bin");
         let chunk_cuckoo_options = ChunkCuckooOptions::default();
@@ -1195,6 +1261,7 @@ mod tests {
             &anchor_seed_chunk_cuckoo,
             &ChunkCuckooOptions {
                 master_seed: 0x875a_2299_804a_46fc,
+                snapshot_anchor: Some(regtest_anchor),
             },
         )
         .expect("build chunk cuckoo with regtest anchor-derived seed");
@@ -1204,9 +1271,19 @@ mod tests {
                 chunks: 111,
                 bins_per_table: 4,
                 slots_per_table: 12,
-                output_bytes: 42_272,
+                output_bytes: 42_308,
                 total_placements: 333,
             }
+        );
+        let anchor_seed_chunk_bytes = std::fs::read(&anchor_seed_chunk_cuckoo).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(anchor_seed_chunk_bytes[0..8].try_into().unwrap()),
+            CHUNK_CUCKOO_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR
+        );
+        assert_eq!(
+            &anchor_seed_chunk_bytes
+                [CHUNK_CUCKOO_HEADER_SIZE..CHUNK_CUCKOO_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
+            &regtest_anchor
         );
         let _ = std::fs::remove_dir_all(dir);
     }

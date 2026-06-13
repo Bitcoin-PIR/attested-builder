@@ -210,6 +210,7 @@ fn index_cuckoo_options(
             Ok(dbpipeline::IndexCuckooOptions {
                 master_seed: seeds.index_master,
                 tag_seed: seeds.index_tag,
+                snapshot_anchor: Some(anchor.to_bytes()),
             })
         }
         None => {
@@ -232,6 +233,7 @@ fn chunk_cuckoo_options(
             println!("chunk_master_seed=0x{:016x}", seeds.chunk_master);
             Ok(dbpipeline::ChunkCuckooOptions {
                 master_seed: seeds.chunk_master,
+                snapshot_anchor: Some(anchor.to_bytes()),
             })
         }
         None => {
