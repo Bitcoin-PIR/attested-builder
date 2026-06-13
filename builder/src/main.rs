@@ -14,6 +14,7 @@ fn main() -> ExitCode {
             build_utxo_chunks(&args[2], &args[3], args.get(4))
         }
         Some("build-index-cuckoo") if args.len() == 4 => build_index_cuckoo(&args[2], &args[3]),
+        Some("build-chunk-cuckoo") if args.len() == 4 => build_chunk_cuckoo(&args[2], &args[3]),
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -84,7 +85,7 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin>\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
 }
 
@@ -132,6 +133,27 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) -> ExitCode {
     ) {
         Ok(report) => {
             println!("index_entries={}", report.index_entries);
+            println!("bins_per_table={}", report.bins_per_table);
+            println!("slots_per_table={}", report.slots_per_table);
+            println!("total_placements={}", report.total_placements);
+            println!("output_bytes={}", report.output_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn build_chunk_cuckoo(chunks_file: &str, output_file: &str) -> ExitCode {
+    match dbpipeline::build_chunk_cuckoo(
+        chunks_file,
+        output_file,
+        &dbpipeline::ChunkCuckooOptions::default(),
+    ) {
+        Ok(report) => {
+            println!("chunks={}", report.chunks);
             println!("bins_per_table={}", report.bins_per_table);
             println!("slots_per_table={}", report.slots_per_table);
             println!("total_placements={}", report.total_placements);
