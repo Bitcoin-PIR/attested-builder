@@ -11,6 +11,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -62,9 +63,14 @@ pub const MERKLE_BUCKET_ROOT_FILENAME: &str = "merkle_bucket_root.bin";
 
 pub const ONION_PACKED_ENTRIES_FILENAME: &str = "onion_packed_entries.bin";
 pub const ONION_INDEX_FILENAME: &str = "onion_index.bin";
+pub const ONION_CHUNK_CUCKOO_FILENAME: &str = "onion_chunk_cuckoo.bin";
+pub const ONION_DATA_BIN_HASHES_FILENAME: &str = "onion_data_bin_hashes.bin";
 pub const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1;
 pub const DEFAULT_ONION_ENTRY_SIZE: usize = 3_328;
 pub const ONION_WHALE_FLAG: u8 = 0x40;
+pub const ONION_DATA_CUCKOO_HASHES: usize = 6;
+pub const ONION_DATA_CUCKOO_HEADER_SIZE: usize = 36;
+pub const ONION_DATA_CUCKOO_MAGIC: u64 = 0xBA7C_0010_0000_0001;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
@@ -95,6 +101,10 @@ pub enum PipelineError {
         script_hash: [u8; 20],
         bytes: usize,
         entries: usize,
+    },
+    InvalidOnionPackedSize {
+        bytes: u64,
+        entry_size: usize,
     },
     InvalidIndexSize {
         bytes: u64,
@@ -156,6 +166,10 @@ impl fmt::Display for PipelineError {
                 f,
                 "serialized onion group {} is {bytes} bytes and needs {entries} entries, exceeds u8",
                 hex::encode(script_hash)
+            ),
+            PipelineError::InvalidOnionPackedSize { bytes, entry_size } => write!(
+                f,
+                "packed Onion file size {bytes} is not divisible by entry size {entry_size}"
             ),
             PipelineError::InvalidIndexSize { bytes } => {
                 write!(
@@ -262,6 +276,32 @@ pub struct OnionPackReport {
     pub data_bytes: u64,
     pub padding_bytes: u64,
     pub max_serialized_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionDataCuckooOptions {
+    pub master_seed: u64,
+    pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub entry_size: usize,
+}
+
+impl Default for OnionDataCuckooOptions {
+    fn default() -> Self {
+        Self {
+            master_seed: LEGACY_CHUNK_MASTER_SEED,
+            snapshot_anchor: None,
+            entry_size: DEFAULT_ONION_ENTRY_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionDataCuckooBuildReport {
+    pub packed_entries: u64,
+    pub bins_per_table: u32,
+    pub output_bytes: u64,
+    pub bin_hashes_file_bytes: u64,
+    pub total_placements: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,6 +495,49 @@ pub fn build_onion_pack(
         }
         Err(e) => {
             for path in [&packed_tmp, &index_tmp] {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+pub fn build_onion_data_cuckoo(
+    packed_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &OnionDataCuckooOptions,
+) -> Result<OnionDataCuckooBuildReport, PipelineError> {
+    validate_onion_entry_size(options.entry_size)?;
+
+    let packed_path = packed_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let cuckoo_path = out_dir.join(ONION_CHUNK_CUCKOO_FILENAME);
+    let bin_hashes_path = out_dir.join(ONION_DATA_BIN_HASHES_FILENAME);
+    for path in [&cuckoo_path, &bin_hashes_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let cuckoo_tmp = temp_path(&cuckoo_path);
+    let bin_hashes_tmp = temp_path(&bin_hashes_path);
+    for path in [&cuckoo_tmp, &bin_hashes_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result = build_onion_data_cuckoo_inner(packed_path, options, &cuckoo_tmp, &bin_hashes_tmp);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&cuckoo_tmp, &cuckoo_path)?;
+            std::fs::rename(&bin_hashes_tmp, &bin_hashes_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            for path in [&cuckoo_tmp, &bin_hashes_tmp] {
                 let _ = std::fs::remove_file(path);
             }
             Err(e)
@@ -1383,6 +1466,87 @@ fn build_onion_pack_inner(
     Ok(report)
 }
 
+fn build_onion_data_cuckoo_inner(
+    packed_path: &Path,
+    options: &OnionDataCuckooOptions,
+    cuckoo_path: &Path,
+    bin_hashes_path: &Path,
+) -> Result<OnionDataCuckooBuildReport, PipelineError> {
+    let bytes = std::fs::metadata(packed_path)?.len();
+    if bytes % options.entry_size as u64 != 0 {
+        return Err(PipelineError::InvalidOnionPackedSize {
+            bytes,
+            entry_size: options.entry_size,
+        });
+    }
+    let packed_entries = bytes / options.entry_size as u64;
+    if packed_entries > u32::MAX as u64 {
+        return Err(PipelineError::OnionEntryIdOverflow(packed_entries));
+    }
+
+    let mut groups: Vec<Vec<u32>> = (0..CHUNK_K).map(|_| Vec::new()).collect();
+    for entry_id in 0..packed_entries as u32 {
+        for group in derive_int_groups_3(entry_id, CHUNK_K) {
+            groups[group].push(entry_id);
+        }
+    }
+
+    let max_group = groups.iter().map(Vec::len).max().unwrap_or(0);
+    let mut bins_per_table = (max_group as f64 / CUCKOO_LOAD_FACTOR).ceil() as usize;
+    let max_retry_bins = max_retry_bins(bins_per_table);
+    let tables = 'retry: loop {
+        let mut tables = Vec::with_capacity(CHUNK_K);
+        for (group_id, entries) in groups.iter().enumerate() {
+            let mut sorted = entries.clone();
+            sorted.sort_unstable();
+            let mut keys = [0u64; ONION_DATA_CUCKOO_HASHES];
+            for (h, key) in keys.iter_mut().enumerate() {
+                *key = derive_cuckoo_key(options.master_seed, group_id, h);
+            }
+            match build_onion_data_cuckoo_table(&sorted, &keys, bins_per_table) {
+                Some(table) => tables.push(table),
+                None if bins_per_table < max_retry_bins => {
+                    bins_per_table += 1;
+                    continue 'retry;
+                }
+                None => {
+                    return Err(PipelineError::CuckooInsertFailed {
+                        group_id,
+                        local_index: sorted.len(),
+                    });
+                }
+            }
+        }
+        break tables;
+    };
+
+    let bins_per_table_u32 = bins_per_table as u32;
+    write_onion_data_cuckoo_file(
+        cuckoo_path,
+        &tables,
+        bins_per_table_u32,
+        packed_entries,
+        options,
+    )?;
+    let bin_hashes_file_bytes = write_onion_data_bin_hashes(
+        bin_hashes_path,
+        packed_path,
+        &tables,
+        bins_per_table,
+        options,
+    )?;
+
+    let header_size =
+        ONION_DATA_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES);
+    Ok(OnionDataCuckooBuildReport {
+        packed_entries,
+        bins_per_table: bins_per_table_u32,
+        output_bytes: header_size as u64 + CHUNK_K as u64 * bins_per_table as u64 * 4,
+        bin_hashes_file_bytes,
+        total_placements: packed_entries * CHUNK_PBC_HASHES as u64,
+    })
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
@@ -1598,6 +1762,161 @@ impl<W: Write> OnionPacker<W> {
         self.current_pos = 0;
         Ok(())
     }
+}
+
+fn build_onion_data_cuckoo_table(
+    entries: &[u32],
+    keys: &[u64; ONION_DATA_CUCKOO_HASHES],
+    bins_per_table: usize,
+) -> Option<Vec<u32>> {
+    let mut table = vec![EMPTY; bins_per_table];
+
+    for &entry_id in entries {
+        let mut placed = false;
+        for &key in keys {
+            let bin = cuckoo_hash_int(entry_id, key, bins_per_table);
+            if table[bin] == EMPTY {
+                table[bin] = entry_id;
+                placed = true;
+                break;
+            }
+        }
+        if placed {
+            continue;
+        }
+
+        let mut current_id = entry_id;
+        let mut current_hash_fn = 0;
+        let mut current_bin = cuckoo_hash_int(entry_id, keys[0], bins_per_table);
+        let mut success = false;
+
+        for kick in 0..CUCKOO_MAX_KICKS {
+            let evicted = table[current_bin];
+            table[current_bin] = current_id;
+
+            let mut found_empty = false;
+            for h in 0..ONION_DATA_CUCKOO_HASHES {
+                let try_h = (current_hash_fn + 1 + h) % ONION_DATA_CUCKOO_HASHES;
+                let bin = cuckoo_hash_int(evicted, keys[try_h], bins_per_table);
+                if bin == current_bin {
+                    continue;
+                }
+                if table[bin] == EMPTY {
+                    table[bin] = evicted;
+                    found_empty = true;
+                    success = true;
+                    break;
+                }
+            }
+            if found_empty {
+                break;
+            }
+
+            let alt_h = (current_hash_fn + 1 + kick % (ONION_DATA_CUCKOO_HASHES - 1))
+                % ONION_DATA_CUCKOO_HASHES;
+            let alt_bin = cuckoo_hash_int(evicted, keys[alt_h], bins_per_table);
+            let final_bin = if alt_bin == current_bin {
+                cuckoo_hash_int(
+                    evicted,
+                    keys[(alt_h + 1) % ONION_DATA_CUCKOO_HASHES],
+                    bins_per_table,
+                )
+            } else {
+                alt_bin
+            };
+
+            current_id = evicted;
+            current_hash_fn = alt_h;
+            current_bin = final_bin;
+        }
+
+        if !success {
+            return None;
+        }
+    }
+
+    Some(table)
+}
+
+fn write_onion_data_cuckoo_file(
+    path: &Path,
+    tables: &[Vec<u32>],
+    bins_per_table: u32,
+    packed_entries: u64,
+    options: &OnionDataCuckooOptions,
+) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create_new(path)?);
+    let magic = cuckoo_magic(ONION_DATA_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    writer.write_all(&magic.to_le_bytes())?;
+    writer.write_all(&(CHUNK_K as u32).to_le_bytes())?;
+    writer.write_all(&(ONION_DATA_CUCKOO_HASHES as u32).to_le_bytes())?;
+    writer.write_all(&bins_per_table.to_le_bytes())?;
+    writer.write_all(&options.master_seed.to_le_bytes())?;
+    writer.write_all(&(packed_entries as u32).to_le_bytes())?;
+    writer.write_all(&[0u8; 4])?;
+    if let Some(anchor) = options.snapshot_anchor {
+        writer.write_all(&anchor)?;
+    }
+
+    for table in tables {
+        for &entry_id in table {
+            writer.write_all(&entry_id.to_le_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_onion_data_bin_hashes(
+    path: &Path,
+    packed_path: &Path,
+    tables: &[Vec<u32>],
+    bins_per_table: usize,
+    options: &OnionDataCuckooOptions,
+) -> Result<u64, PipelineError> {
+    let packed_file = File::open(packed_path)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create_new(path)?);
+    writer.write_all(&(CHUNK_K as u32).to_le_bytes())?;
+    writer.write_all(&(bins_per_table as u32).to_le_bytes())?;
+
+    let zero_entry = vec![0u8; options.entry_size];
+    let zero_hash = sha256(&zero_entry);
+    let mut entry = vec![0u8; options.entry_size];
+    for table in tables {
+        for &entry_id in table.iter().take(bins_per_table) {
+            let hash = if entry_id == EMPTY {
+                zero_hash
+            } else {
+                read_packed_entry_at(&packed_file, options.entry_size, entry_id, &mut entry)?;
+                sha256(&entry)
+            };
+            writer.write_all(&hash)?;
+        }
+    }
+    writer.flush()?;
+    Ok(8 + CHUNK_K as u64 * bins_per_table as u64 * MERKLE_HASH_SIZE as u64)
+}
+
+fn read_packed_entry_at(
+    file: &File,
+    entry_size: usize,
+    entry_id: u32,
+    buf: &mut [u8],
+) -> Result<(), PipelineError> {
+    debug_assert_eq!(buf.len(), entry_size);
+    let mut read = 0usize;
+    let offset = entry_id as u64 * entry_size as u64;
+    while read < entry_size {
+        let n = file.read_at(&mut buf[read..], offset + read as u64)?;
+        if n == 0 {
+            return Err(PipelineError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read for packed onion entry {entry_id}"),
+            )));
+        }
+        read += n;
+    }
+    Ok(())
 }
 
 fn compute_bins_per_table(max_load: usize, slots_per_bin: usize) -> usize {
@@ -2019,6 +2338,89 @@ mod tests {
                 "{file} differs across repeated builds"
             );
         }
+
+        let onion_data_report1 = build_onion_data_cuckoo(
+            out1.join(ONION_PACKED_ENTRIES_FILENAME),
+            &out1,
+            &OnionDataCuckooOptions::default(),
+        )
+        .expect("build onion data cuckoo 1");
+        let onion_data_report2 = build_onion_data_cuckoo(
+            out2.join(ONION_PACKED_ENTRIES_FILENAME),
+            &out2,
+            &OnionDataCuckooOptions::default(),
+        )
+        .expect("build onion data cuckoo 2");
+        let expected_onion_data = OnionDataCuckooBuildReport {
+            packed_entries: 3,
+            bins_per_table: 2,
+            output_bytes: 676,
+            bin_hashes_file_bytes: 5_128,
+            total_placements: 9,
+        };
+        assert_eq!(onion_data_report1, expected_onion_data);
+        assert_eq!(onion_data_report2, expected_onion_data);
+        for file in [ONION_CHUNK_CUCKOO_FILENAME, ONION_DATA_BIN_HASHES_FILENAME] {
+            assert_eq!(
+                std::fs::read(out1.join(file)).unwrap(),
+                std::fs::read(out2.join(file)).unwrap(),
+                "{file} differs across repeated builds"
+            );
+        }
+        let onion_data_cuckoo_bytes =
+            std::fs::read(out1.join(ONION_CHUNK_CUCKOO_FILENAME)).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(onion_data_cuckoo_bytes[0..8].try_into().unwrap()),
+            ONION_DATA_CUCKOO_MAGIC
+        );
+        assert_eq!(
+            u64::from_le_bytes(onion_data_cuckoo_bytes[20..28].try_into().unwrap()),
+            LEGACY_CHUNK_MASTER_SEED
+        );
+
+        let onion_data_anchor1 = dir.join("onion-data-anchor-1");
+        let onion_data_anchor2 = dir.join("onion-data-anchor-2");
+        let onion_data_anchor_options = OnionDataCuckooOptions {
+            master_seed: 0x875a_2299_804a_46fc,
+            snapshot_anchor: Some(regtest_anchor),
+            ..Default::default()
+        };
+        let onion_data_anchor_report1 = build_onion_data_cuckoo(
+            out1.join(ONION_PACKED_ENTRIES_FILENAME),
+            &onion_data_anchor1,
+            &onion_data_anchor_options,
+        )
+        .expect("build anchored onion data cuckoo 1");
+        let onion_data_anchor_report2 = build_onion_data_cuckoo(
+            out1.join(ONION_PACKED_ENTRIES_FILENAME),
+            &onion_data_anchor2,
+            &onion_data_anchor_options,
+        )
+        .expect("build anchored onion data cuckoo 2");
+        let expected_onion_data_anchor = OnionDataCuckooBuildReport {
+            output_bytes: 712,
+            ..expected_onion_data
+        };
+        assert_eq!(onion_data_anchor_report1, expected_onion_data_anchor);
+        assert_eq!(onion_data_anchor_report2, expected_onion_data_anchor);
+        for file in [ONION_CHUNK_CUCKOO_FILENAME, ONION_DATA_BIN_HASHES_FILENAME] {
+            assert_eq!(
+                std::fs::read(onion_data_anchor1.join(file)).unwrap(),
+                std::fs::read(onion_data_anchor2.join(file)).unwrap(),
+                "{file} differs across repeated anchored builds"
+            );
+        }
+        let anchored_onion_data_cuckoo =
+            std::fs::read(onion_data_anchor1.join(ONION_CHUNK_CUCKOO_FILENAME)).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(anchored_onion_data_cuckoo[0..8].try_into().unwrap()),
+            ONION_DATA_CUCKOO_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR
+        );
+        assert_eq!(
+            &anchored_onion_data_cuckoo
+                [ONION_DATA_CUCKOO_HEADER_SIZE..ONION_DATA_CUCKOO_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
+            &regtest_anchor
+        );
 
         let cuckoo1 = dir.join("index-cuckoo-1.bin");
         let cuckoo2 = dir.join("index-cuckoo-2.bin");

@@ -75,8 +75,12 @@ enclave-resident with pinned PCRs; browsers never parse them.
   threshold. The Onion packed-entry stage is now split out too:
   verified flat `utxo_set.bin` → `onion_packed_entries.bin` +
   `onion_index.bin`, with the Onion entry size explicit in the stage
-  options so root bundles can bind it. Splitting Onion index cuckoo/PIR,
-  Onion data PIR, and Onion Merkle stages is the next pipeline cut.
+  options so root bundles can bind it. The pure Rust half of
+  `gen_2_onion` is also split: `onion_packed_entries.bin` →
+  `onion_chunk_cuckoo.bin` + `onion_data_bin_hashes.bin`, with
+  chain-derived data-cuckoo seeds when `chain_anchor.bin` is supplied.
+  The remaining Onion cuts are the FFI-heavy data NTT store, Onion index
+  cuckoo/PIR, and Onion Merkle stages.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
