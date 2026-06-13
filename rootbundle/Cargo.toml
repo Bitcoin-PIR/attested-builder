@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 # Same version/feature shape as pir-identity, resolves against ../../vendor.
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+sha2 = { version = "=0.10.9", default-features = false }
 
 [dev-dependencies]
 hex = "=0.4.3"

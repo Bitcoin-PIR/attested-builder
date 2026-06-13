@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 hex = "=0.4.3"
+rootbundle = { path = "../rootbundle" }
 utxosnapshot = { path = "../utxosnapshot" }

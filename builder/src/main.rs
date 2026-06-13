@@ -9,6 +9,7 @@ fn main() -> ExitCode {
         Some("materialize-utxo-set") if args.len() == 7 => {
             materialize_utxo_set(&args[2], &args[3], &args[4], &args[5], &args[6])
         }
+        Some("params-hash") if args.len() == 5 => params_hash(&args[2], &args[3], &args[4]),
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -79,6 +80,31 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
+}
+
+fn params_hash(index_bins: &str, chunk_bins: &str, onion_entry_size: &str) -> ExitCode {
+    let Ok(index_bins) = index_bins.parse::<u32>() else {
+        eprintln!("error: index-bins-per-table must be a u32: {index_bins}");
+        return ExitCode::from(2);
+    };
+    let Ok(chunk_bins) = chunk_bins.parse::<u32>() else {
+        eprintln!("error: chunk-bins-per-table must be a u32: {chunk_bins}");
+        return ExitCode::from(2);
+    };
+    let Ok(onion_entry_size) = onion_entry_size.parse::<u32>() else {
+        eprintln!("error: onion-entry-size must be a u32: {onion_entry_size}");
+        return ExitCode::from(2);
+    };
+    let params =
+        rootbundle::BuildParamsV1::current_snapshot(index_bins, chunk_bins, onion_entry_size);
+    println!("index_dpf_n={}", params.index.dpf_n);
+    println!("chunk_dpf_n={}", params.chunk.dpf_n);
+    println!(
+        "onion_index_slots_per_bin={}",
+        params.onion_index_slots_per_bin
+    );
+    println!("params_hash={}", hex::encode(params.params_hash()));
+    ExitCode::SUCCESS
 }

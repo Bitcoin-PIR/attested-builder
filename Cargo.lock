@@ -270,6 +270,7 @@ name = "pir-attested-builder"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "rootbundle",
  "utxosnapshot",
 ]
 
@@ -316,6 +317,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "sha2",
 ]
 
 [[package]]

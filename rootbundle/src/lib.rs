@@ -15,10 +15,12 @@
 //! to exactly one interpretation.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
 /// Domain-separation prefix for bundle signatures. Versioned: any change
 /// to the payload layout must bump both this tag and `PAYLOAD_VERSION`.
 pub const SIGNING_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/root-bundle/v1\0";
+pub const PARAMS_HASH_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-params/v1\0";
 
 /// Payload layout version (field of the payload itself).
 pub const PAYLOAD_VERSION: u16 = 1;
@@ -68,6 +70,158 @@ pub struct ChainAnchor {
 pub struct NamedRoot {
     pub label: String,
     pub root: [u8; 32],
+}
+
+/// Canonical layout parameters for one cuckoo/PBC table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableParamsV1 {
+    pub k: u16,
+    pub pbc_num_hashes: u16,
+    pub bins_per_table: u32,
+    pub slots_per_bin: u16,
+    pub cuckoo_num_hashes: u16,
+    pub slot_size: u16,
+    pub dpf_n: u8,
+    pub magic: u64,
+    pub header_size: u16,
+    pub has_tag_seed: bool,
+}
+
+/// Versioned build/layout parameters committed by `params_hash`.
+///
+/// These are the knobs that change the interpretation of Merkle roots and
+/// query/proof bytes. Filter knobs (`dust_threshold_sats`,
+/// `max_utxos_per_spk`) are separate first-class bundle fields, not hidden
+/// inside this hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildParamsV1 {
+    pub flat_utxo_entry_size: u16,
+    pub script_hash_size: u16,
+    pub txid_size: u16,
+    pub index_record_size: u16,
+    pub chunk_size: u16,
+    pub chunks_per_unit: u16,
+    pub index: TableParamsV1,
+    pub chunk: TableParamsV1,
+    pub onion_entry_size: u32,
+    pub onion_index_record_size: u16,
+    pub onion_index_slot_size: u16,
+    pub onion_index_slots_per_bin: u16,
+    pub onion_chunk_k: u16,
+    pub merkle_arity: u16,
+    pub merkle_hash_bytes: u16,
+    /// Zero documents the Phase-4 decision to remove M=16 chunk-Merkle
+    /// item-count padding.
+    pub chunk_merkle_item_pad: u16,
+}
+
+impl BuildParamsV1 {
+    /// Current production-ish defaults, with the sizing values that vary by
+    /// database instance passed explicitly.
+    pub fn current_snapshot(
+        index_bins_per_table: u32,
+        chunk_bins_per_table: u32,
+        onion_entry_size: u32,
+    ) -> Self {
+        let onion_index_slot_size = 15;
+        Self {
+            flat_utxo_entry_size: 68,
+            script_hash_size: 20,
+            txid_size: 32,
+            index_record_size: 25,
+            chunk_size: 40,
+            chunks_per_unit: 1,
+            index: TableParamsV1 {
+                k: 75,
+                pbc_num_hashes: 3,
+                bins_per_table: index_bins_per_table,
+                slots_per_bin: 4,
+                cuckoo_num_hashes: 2,
+                slot_size: 13,
+                dpf_n: compute_dpf_n(index_bins_per_table),
+                magic: 0xBA7C_C000_C000_0004,
+                header_size: 40,
+                has_tag_seed: true,
+            },
+            chunk: TableParamsV1 {
+                k: 80,
+                pbc_num_hashes: 3,
+                bins_per_table: chunk_bins_per_table,
+                slots_per_bin: 3,
+                cuckoo_num_hashes: 2,
+                slot_size: 44,
+                dpf_n: compute_dpf_n(chunk_bins_per_table),
+                magic: 0xBA7C_C000_C000_0002,
+                header_size: 32,
+                has_tag_seed: false,
+            },
+            onion_entry_size,
+            onion_index_record_size: 27,
+            onion_index_slot_size,
+            onion_index_slots_per_bin: (onion_entry_size / onion_index_slot_size as u32) as u16,
+            onion_chunk_k: 80,
+            merkle_arity: 8,
+            merkle_hash_bytes: 32,
+            chunk_merkle_item_pad: 0,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(160);
+        put_bytes(&mut out, &1u16.to_le_bytes());
+        put_bytes(&mut out, &self.flat_utxo_entry_size.to_le_bytes());
+        put_bytes(&mut out, &self.script_hash_size.to_le_bytes());
+        put_bytes(&mut out, &self.txid_size.to_le_bytes());
+        put_bytes(&mut out, &self.index_record_size.to_le_bytes());
+        put_bytes(&mut out, &self.chunk_size.to_le_bytes());
+        put_bytes(&mut out, &self.chunks_per_unit.to_le_bytes());
+        self.index.encode_into(&mut out);
+        self.chunk.encode_into(&mut out);
+        put_bytes(&mut out, &self.onion_entry_size.to_le_bytes());
+        put_bytes(&mut out, &self.onion_index_record_size.to_le_bytes());
+        put_bytes(&mut out, &self.onion_index_slot_size.to_le_bytes());
+        put_bytes(&mut out, &self.onion_index_slots_per_bin.to_le_bytes());
+        put_bytes(&mut out, &self.onion_chunk_k.to_le_bytes());
+        put_bytes(&mut out, &self.merkle_arity.to_le_bytes());
+        put_bytes(&mut out, &self.merkle_hash_bytes.to_le_bytes());
+        put_bytes(&mut out, &self.chunk_merkle_item_pad.to_le_bytes());
+        out
+    }
+
+    pub fn params_hash(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(PARAMS_HASH_DOMAIN);
+        h.update(self.encode());
+        h.finalize().into()
+    }
+}
+
+impl TableParamsV1 {
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        put_bytes(out, &self.k.to_le_bytes());
+        put_bytes(out, &self.pbc_num_hashes.to_le_bytes());
+        put_bytes(out, &self.bins_per_table.to_le_bytes());
+        put_bytes(out, &self.slots_per_bin.to_le_bytes());
+        put_bytes(out, &self.cuckoo_num_hashes.to_le_bytes());
+        put_bytes(out, &self.slot_size.to_le_bytes());
+        out.push(self.dpf_n);
+        put_bytes(out, &self.magic.to_le_bytes());
+        put_bytes(out, &self.header_size.to_le_bytes());
+        out.push(u8::from(self.has_tag_seed));
+    }
+}
+
+pub fn compute_dpf_n(bins_per_table: u32) -> u8 {
+    if bins_per_table <= 1 {
+        return 1;
+    }
+    let mut n = 0u8;
+    let mut v = 1u32;
+    while v < bins_per_table {
+        v <<= 1;
+        n += 1;
+    }
+    n
 }
 
 /// The unsigned, canonical bundle payload.
@@ -407,6 +561,7 @@ mod tests {
     }
 
     fn payload() -> RootBundlePayload {
+        let params_hash = BuildParamsV1::current_snapshot(565_684, 1_064_454, 3_328).params_hash();
         RootBundlePayload {
             network_magic: [0xf9, 0xbe, 0xb4, 0xd9],
             build_kind: BuildKind::Snapshot,
@@ -421,7 +576,7 @@ mod tests {
             utxo_muhash: [0xcd; 32],
             dust_threshold_sats: 576,
             max_utxos_per_spk: 100,
-            params_hash: [0x11; 32],
+            params_hash,
             issued_at: 1_780_000_000,
             roots: vec![
                 NamedRoot {
@@ -578,5 +733,40 @@ mod tests {
             bundle.verify_quorum(&trusted, 1),
             Err(BundleError::BadSignature)
         );
+    }
+
+    #[test]
+    fn build_params_canonical_hash_surface() {
+        let p = BuildParamsV1::current_snapshot(565_684, 1_064_454, 3_328);
+        assert_eq!(p.index.dpf_n, 20);
+        assert_eq!(p.chunk.dpf_n, 21);
+        assert_eq!(p.onion_index_slots_per_bin, 221);
+        assert_eq!(p.encode().len(), 84);
+        assert_eq!(
+            hex::encode(p.params_hash()),
+            "5138dd0d022c4bbb386860a56fb0fd837e4cd947ed71cbbeab058023b839ec12"
+        );
+
+        let same = BuildParamsV1::current_snapshot(565_684, 1_064_454, 3_328);
+        let different_bins = BuildParamsV1::current_snapshot(565_685, 1_064_454, 3_328);
+        let different_onion = BuildParamsV1::current_snapshot(565_684, 1_064_454, 3_840);
+        assert_eq!(p.params_hash(), same.params_hash());
+        assert_ne!(p.params_hash(), different_bins.params_hash());
+        assert_ne!(p.params_hash(), different_onion.params_hash());
+    }
+
+    #[test]
+    fn dpf_n_matches_pir_core_cases() {
+        assert_eq!(compute_dpf_n(0), 1);
+        assert_eq!(compute_dpf_n(1), 1);
+        assert_eq!(compute_dpf_n(2), 1);
+        assert_eq!(compute_dpf_n(3), 2);
+        assert_eq!(compute_dpf_n(4), 2);
+        assert_eq!(compute_dpf_n(5), 3);
+        assert_eq!(compute_dpf_n(1024), 10);
+        assert_eq!(compute_dpf_n(1025), 11);
+        assert_eq!(compute_dpf_n(565_684), 20);
+        assert_eq!(compute_dpf_n(1_064_454), 21);
+        assert_eq!(compute_dpf_n(10_000), 14);
     }
 }
