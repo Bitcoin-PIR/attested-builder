@@ -72,8 +72,11 @@ enclave-resident with pinned PCRs; browsers never parse them.
   is also split out: `batch_pir_cuckoo.bin` + `chunk_pir_cuckoo.bin` →
   `merkle_bucket_{tree_tops,roots,root}.bin` plus any low-level
   sibling tables needed when a tree exceeds the 1024-node tree-top
-  threshold. Splitting the Onion Merkle/Onion table stages is the next
-  pipeline cut.
+  threshold. The Onion packed-entry stage is now split out too:
+  verified flat `utxo_set.bin` → `onion_packed_entries.bin` +
+  `onion_index.bin`, with the Onion entry size explicit in the stage
+  options so root bundles can bind it. Splitting Onion index cuckoo/PIR,
+  Onion data PIR, and Onion Merkle stages is the next pipeline cut.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

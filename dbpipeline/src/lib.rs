@@ -60,6 +60,12 @@ pub const MERKLE_BUCKET_TREE_TOPS_FILENAME: &str = "merkle_bucket_tree_tops.bin"
 pub const MERKLE_BUCKET_ROOTS_FILENAME: &str = "merkle_bucket_roots.bin";
 pub const MERKLE_BUCKET_ROOT_FILENAME: &str = "merkle_bucket_root.bin";
 
+pub const ONION_PACKED_ENTRIES_FILENAME: &str = "onion_packed_entries.bin";
+pub const ONION_INDEX_FILENAME: &str = "onion_index.bin";
+pub const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1;
+pub const DEFAULT_ONION_ENTRY_SIZE: usize = 3_328;
+pub const ONION_WHALE_FLAG: u8 = 0x40;
+
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
@@ -82,6 +88,13 @@ pub enum PipelineError {
     ChunkCountOverflow {
         script_hash: [u8; 20],
         chunks: usize,
+    },
+    InvalidOnionEntrySize(usize),
+    OnionEntryIdOverflow(u64),
+    OnionSpanOverflow {
+        script_hash: [u8; 20],
+        bytes: usize,
+        entries: usize,
     },
     InvalidIndexSize {
         bytes: u64,
@@ -125,6 +138,23 @@ impl fmt::Display for PipelineError {
             } => write!(
                 f,
                 "serialized group {} needs {chunks} chunks, exceeds u8",
+                hex::encode(script_hash)
+            ),
+            PipelineError::InvalidOnionEntrySize(size) => write!(
+                f,
+                "onion entry size must be in 1..={}; got {size}",
+                u16::MAX
+            ),
+            PipelineError::OnionEntryIdOverflow(id) => {
+                write!(f, "onion entry id overflows u32: {id}")
+            }
+            PipelineError::OnionSpanOverflow {
+                script_hash,
+                bytes,
+                entries,
+            } => write!(
+                f,
+                "serialized onion group {} is {bytes} bytes and needs {entries} entries, exceeds u8",
                 hex::encode(script_hash)
             ),
             PipelineError::InvalidIndexSize { bytes } => {
@@ -199,6 +229,39 @@ pub struct UtxoChunkBuildReport {
     pub index_file_bytes: u64,
     pub data_bytes: u64,
     pub padding_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionPackOptions {
+    pub partitions: usize,
+    pub dust_threshold_sats: u64,
+    pub max_utxos_per_spk: usize,
+    pub entry_size: usize,
+}
+
+impl Default for OnionPackOptions {
+    fn default() -> Self {
+        Self {
+            partitions: 4,
+            dust_threshold_sats: DUST_THRESHOLD_SATS,
+            max_utxos_per_spk: MAX_UTXOS_PER_SPK,
+            entry_size: DEFAULT_ONION_ENTRY_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionPackReport {
+    pub input_entries: u64,
+    pub dust_utxos_skipped: u64,
+    pub whale_spks_excluded: u64,
+    pub groups_packed: u64,
+    pub onion_entries: u64,
+    pub packed_file_bytes: u64,
+    pub index_file_bytes: u64,
+    pub data_bytes: u64,
+    pub padding_bytes: u64,
+    pub max_serialized_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +409,52 @@ pub fn build_utxo_chunks(
         }
         Err(e) => {
             for path in [&chunks_tmp, &index_tmp, &top_tmp, &whales_tmp] {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+pub fn build_onion_pack(
+    flat_utxo_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &OnionPackOptions,
+) -> Result<OnionPackReport, PipelineError> {
+    if options.partitions == 0 {
+        return Err(PipelineError::InvalidPartitions(options.partitions));
+    }
+    validate_onion_entry_size(options.entry_size)?;
+
+    let flat_utxo_path = flat_utxo_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let packed_path = out_dir.join(ONION_PACKED_ENTRIES_FILENAME);
+    let index_path = out_dir.join(ONION_INDEX_FILENAME);
+    for path in [&packed_path, &index_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let packed_tmp = temp_path(&packed_path);
+    let index_tmp = temp_path(&index_path);
+    for path in [&packed_tmp, &index_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result = build_onion_pack_inner(flat_utxo_path, options, &packed_tmp, &index_tmp);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&packed_tmp, &packed_path)?;
+            std::fs::rename(&index_tmp, &index_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            for path in [&packed_tmp, &index_tmp] {
                 let _ = std::fs::remove_file(path);
             }
             Err(e)
@@ -1185,6 +1294,95 @@ fn build_utxo_chunks_inner(
     Ok(report)
 }
 
+fn build_onion_pack_inner(
+    flat_utxo_path: &Path,
+    options: &OnionPackOptions,
+    packed_path: &Path,
+    index_path: &Path,
+) -> Result<OnionPackReport, PipelineError> {
+    let bytes = std::fs::metadata(flat_utxo_path)?.len();
+    if bytes % FLAT_UTXO_ENTRY_SIZE as u64 != 0 {
+        return Err(PipelineError::InvalidFlatUtxoSize { bytes });
+    }
+    let input_entries = bytes / FLAT_UTXO_ENTRY_SIZE as u64;
+
+    let packed_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(packed_path)?);
+    let mut packer = OnionPacker::new(packed_writer, options.entry_size);
+    let mut index_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(index_path)?);
+
+    let mut report = OnionPackReport {
+        input_entries,
+        dust_utxos_skipped: 0,
+        whale_spks_excluded: 0,
+        groups_packed: 0,
+        onion_entries: 0,
+        packed_file_bytes: 0,
+        index_file_bytes: 0,
+        data_bytes: 0,
+        padding_bytes: 0,
+        max_serialized_len: 0,
+    };
+
+    for partition in 0..options.partitions {
+        let mut map: HashMap<[u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>> = HashMap::new();
+        for entry in FlatEntryIter::open(flat_utxo_path)? {
+            let entry = entry?;
+            if entry.script_hash[0] as usize % options.partitions != partition {
+                continue;
+            }
+            if entry.amount <= options.dust_threshold_sats {
+                report.dust_utxos_skipped += 1;
+                continue;
+            }
+            map.entry(entry.script_hash)
+                .or_default()
+                .push(ShortenedEntry {
+                    txid: entry.txid,
+                    vout: entry.vout,
+                    amount: entry.amount,
+                    height: entry.height,
+                });
+        }
+
+        let mut groups: Vec<([u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>)> =
+            map.into_iter().collect();
+        groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for (script_hash, mut entries) in groups {
+            if entries.len() > options.max_utxos_per_spk {
+                write_onion_index_entry(&mut index_writer, &script_hash, 0, 0, ONION_WHALE_FLAG)?;
+                report.whale_spks_excluded += 1;
+                continue;
+            }
+
+            entries.sort_unstable_by(|a, b| b.height.cmp(&a.height));
+            let data = serialize_group_sorted(&entries);
+            report.max_serialized_len = report.max_serialized_len.max(data.len());
+            let (entry_id, byte_offset, num_entries) = packer.pack(&script_hash, &data)?;
+            write_onion_index_entry(
+                &mut index_writer,
+                &script_hash,
+                entry_id,
+                byte_offset,
+                num_entries,
+            )?;
+            report.groups_packed += 1;
+        }
+    }
+
+    packer.finish()?;
+    index_writer.flush()?;
+
+    report.onion_entries = packer.entry_count;
+    report.packed_file_bytes = packer.entry_count * options.entry_size as u64;
+    report.index_file_bytes =
+        (report.groups_packed + report.whale_spks_excluded) * ONION_INDEX_RECORD_SIZE as u64;
+    report.data_bytes = packer.total_data;
+    report.padding_bytes = packer.total_padding;
+
+    Ok(report)
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
@@ -1253,6 +1451,153 @@ fn write_index_entry<W: Write>(
     writer.write_all(&start_chunk_id.to_le_bytes())?;
     writer.write_all(&[num_chunks])?;
     Ok(())
+}
+
+fn validate_onion_entry_size(entry_size: usize) -> Result<(), PipelineError> {
+    if entry_size == 0 || entry_size > u16::MAX as usize {
+        return Err(PipelineError::InvalidOnionEntrySize(entry_size));
+    }
+    Ok(())
+}
+
+fn write_onion_index_entry<W: Write>(
+    writer: &mut W,
+    script_hash: &[u8; SCRIPT_HASH_SIZE],
+    entry_id: u32,
+    byte_offset: u16,
+    num_entries: u8,
+) -> Result<(), PipelineError> {
+    writer.write_all(script_hash)?;
+    writer.write_all(&entry_id.to_le_bytes())?;
+    writer.write_all(&byte_offset.to_le_bytes())?;
+    writer.write_all(&[num_entries])?;
+    Ok(())
+}
+
+struct OnionPacker<W: Write> {
+    writer: W,
+    current_entry: Vec<u8>,
+    current_pos: usize,
+    entry_count: u64,
+    total_padding: u64,
+    total_data: u64,
+    entry_size: usize,
+}
+
+impl<W: Write> OnionPacker<W> {
+    fn new(writer: W, entry_size: usize) -> Self {
+        Self {
+            writer,
+            current_entry: vec![0u8; entry_size],
+            current_pos: 0,
+            entry_count: 0,
+            total_padding: 0,
+            total_data: 0,
+            entry_size,
+        }
+    }
+
+    fn pack(
+        &mut self,
+        script_hash: &[u8; SCRIPT_HASH_SIZE],
+        data: &[u8],
+    ) -> Result<(u32, u16, u8), PipelineError> {
+        let data_len = data.len();
+        self.total_data += data_len as u64;
+
+        if data_len == 0 {
+            return Ok((self.current_entry_id()?, self.current_pos as u16, 1));
+        }
+
+        let remaining = self.entry_size - self.current_pos;
+        if data_len <= remaining {
+            let entry_id = self.current_entry_id()?;
+            let offset = self.current_pos;
+            self.current_entry[self.current_pos..self.current_pos + data_len].copy_from_slice(data);
+            self.current_pos += data_len;
+            if self.current_pos == self.entry_size {
+                self.write_full_current_entry()?;
+            }
+            return Ok((entry_id, offset as u16, 1));
+        }
+
+        self.flush_partial_entry()?;
+        let entry_id_u64 = self.entry_count;
+        let entry_id = self.current_entry_id()?;
+
+        if data_len <= self.entry_size {
+            self.current_entry[..data_len].copy_from_slice(data);
+            self.current_pos = data_len;
+            if self.current_pos == self.entry_size {
+                self.write_full_current_entry()?;
+            }
+            return Ok((entry_id, 0, 1));
+        }
+
+        let num_entries = data_len.div_ceil(self.entry_size);
+        if num_entries > u8::MAX as usize {
+            return Err(PipelineError::OnionSpanOverflow {
+                script_hash: *script_hash,
+                bytes: data_len,
+                entries: num_entries,
+            });
+        }
+        if entry_id_u64 + num_entries as u64 - 1 > u32::MAX as u64 {
+            return Err(PipelineError::OnionEntryIdOverflow(
+                entry_id_u64 + num_entries as u64 - 1,
+            ));
+        }
+
+        let mut written = 0;
+        for i in 0..num_entries {
+            let chunk_len = (data_len - written).min(self.entry_size);
+            self.current_entry[..chunk_len].copy_from_slice(&data[written..written + chunk_len]);
+            written += chunk_len;
+
+            if i < num_entries - 1 {
+                self.write_full_current_entry()?;
+            } else {
+                self.current_pos = chunk_len;
+                if self.current_pos == self.entry_size {
+                    self.write_full_current_entry()?;
+                }
+            }
+        }
+
+        Ok((entry_id, 0, num_entries as u8))
+    }
+
+    fn finish(&mut self) -> Result<(), PipelineError> {
+        self.flush_partial_entry()?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn current_entry_id(&self) -> Result<u32, PipelineError> {
+        if self.entry_count > u32::MAX as u64 {
+            return Err(PipelineError::OnionEntryIdOverflow(self.entry_count));
+        }
+        Ok(self.entry_count as u32)
+    }
+
+    fn flush_partial_entry(&mut self) -> Result<(), PipelineError> {
+        if self.current_pos > 0 {
+            self.writer.write_all(&self.current_entry)?;
+            self.total_padding += (self.entry_size - self.current_pos) as u64;
+            self.entry_count += 1;
+            self.current_entry.fill(0);
+            self.current_pos = 0;
+        }
+        Ok(())
+    }
+
+    fn write_full_current_entry(&mut self) -> Result<(), PipelineError> {
+        self.writer.write_all(&self.current_entry)?;
+        self.entry_count += 1;
+        self.current_entry.fill(0);
+        self.current_pos = 0;
+        Ok(())
+    }
 }
 
 fn compute_bins_per_table(max_load: usize, slots_per_bin: usize) -> usize {
@@ -1642,6 +1987,32 @@ mod tests {
             TOP100_FILENAME,
             WHALES_FILENAME,
         ] {
+            assert_eq!(
+                std::fs::read(out1.join(file)).unwrap(),
+                std::fs::read(out2.join(file)).unwrap(),
+                "{file} differs across repeated builds"
+            );
+        }
+
+        let onion_options = OnionPackOptions::default();
+        let onion_report1 = build_onion_pack(&flat, &out1, &onion_options).expect("build onion 1");
+        let onion_report2 = build_onion_pack(&flat, &out2, &onion_options).expect("build onion 2");
+        let expected_onion = OnionPackReport {
+            input_entries: 115,
+            dust_utxos_skipped: 0,
+            whale_spks_excluded: 0,
+            groups_packed: 9,
+            onion_entries: 3,
+            packed_file_bytes: 9_984,
+            index_file_bytes: 243,
+            data_bytes: 4_375,
+            padding_bytes: 5_609,
+            max_serialized_len: 3_801,
+        };
+        assert_eq!(onion_report1, expected_onion);
+        assert_eq!(onion_report2, expected_onion);
+
+        for file in [ONION_PACKED_ENTRIES_FILENAME, ONION_INDEX_FILENAME] {
             assert_eq!(
                 std::fs::read(out1.join(file)).unwrap(),
                 std::fs::read(out2.join(file)).unwrap(),
