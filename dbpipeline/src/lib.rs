@@ -372,19 +372,31 @@ fn build_index_cuckoo_inner(
     }
 
     let max_load = group_entries.iter().map(Vec::len).max().unwrap_or(0);
-    let bins_per_table = compute_bins_per_table(max_load, INDEX_SLOTS_PER_BIN);
+    let mut bins_per_table = compute_bins_per_table(max_load, INDEX_SLOTS_PER_BIN);
+    let max_retry_bins = max_retry_bins(bins_per_table);
+    let tables = 'retry: loop {
+        let mut tables = Vec::with_capacity(INDEX_K);
+        for (group_id, entries) in group_entries.iter().enumerate() {
+            match build_index_cuckoo_table(
+                &data,
+                entries,
+                group_id,
+                bins_per_table,
+                options.master_seed,
+            ) {
+                Ok(table) => tables.push(table),
+                Err(PipelineError::CuckooInsertFailed { .. })
+                    if bins_per_table < max_retry_bins =>
+                {
+                    bins_per_table += 1;
+                    continue 'retry;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        break tables;
+    };
     let slots_per_table = bins_per_table * INDEX_SLOTS_PER_BIN;
-
-    let mut tables = Vec::with_capacity(INDEX_K);
-    for (group_id, entries) in group_entries.iter().enumerate() {
-        tables.push(build_index_cuckoo_table(
-            &data,
-            entries,
-            group_id,
-            bins_per_table,
-            options.master_seed,
-        )?);
-    }
 
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(output_path)?);
     write_index_cuckoo_header(&mut writer, bins_per_table as u32, options)?;
@@ -471,18 +483,26 @@ fn build_chunk_cuckoo_inner(
     }
 
     let max_load = group_chunks.iter().map(Vec::len).max().unwrap_or(0);
-    let bins_per_table = compute_bins_per_table(max_load, CHUNK_SLOTS_PER_BIN);
+    let mut bins_per_table = compute_bins_per_table(max_load, CHUNK_SLOTS_PER_BIN);
+    let max_retry_bins = max_retry_bins(bins_per_table);
+    let tables = 'retry: loop {
+        let mut tables = Vec::with_capacity(CHUNK_K);
+        for (group_id, chunk_ids) in group_chunks.iter().enumerate() {
+            match build_chunk_cuckoo_table(chunk_ids, group_id, bins_per_table, options.master_seed)
+            {
+                Ok(table) => tables.push(table),
+                Err(PipelineError::CuckooInsertFailed { .. })
+                    if bins_per_table < max_retry_bins =>
+                {
+                    bins_per_table += 1;
+                    continue 'retry;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        break tables;
+    };
     let slots_per_table = bins_per_table * CHUNK_SLOTS_PER_BIN;
-
-    let mut tables = Vec::with_capacity(CHUNK_K);
-    for (group_id, chunk_ids) in group_chunks.iter().enumerate() {
-        tables.push(build_chunk_cuckoo_table(
-            chunk_ids,
-            group_id,
-            bins_per_table,
-            options.master_seed,
-        )?);
-    }
 
     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create_new(output_path)?);
     write_chunk_cuckoo_header(&mut writer, bins_per_table as u32, options)?;
@@ -705,6 +725,10 @@ fn write_index_entry<W: Write>(
 
 fn compute_bins_per_table(max_load: usize, slots_per_bin: usize) -> usize {
     (max_load as f64 / (slots_per_bin as f64 * CUCKOO_LOAD_FACTOR)).ceil() as usize
+}
+
+fn max_retry_bins(initial_bins: usize) -> usize {
+    initial_bins.saturating_add(1024).max(initial_bins * 2)
 }
 
 #[inline]
@@ -1163,6 +1187,26 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(chunk_cuckoo_bytes1[24..32].try_into().unwrap()),
             LEGACY_CHUNK_MASTER_SEED
+        );
+
+        let anchor_seed_chunk_cuckoo = dir.join("chunk-cuckoo-anchor-seed.bin");
+        let anchor_seed_chunk_report = build_chunk_cuckoo(
+            out1.join(UTXO_CHUNKS_FILENAME),
+            &anchor_seed_chunk_cuckoo,
+            &ChunkCuckooOptions {
+                master_seed: 0x875a_2299_804a_46fc,
+            },
+        )
+        .expect("build chunk cuckoo with regtest anchor-derived seed");
+        assert_eq!(
+            anchor_seed_chunk_report,
+            ChunkCuckooBuildReport {
+                chunks: 111,
+                bins_per_table: 4,
+                slots_per_table: 12,
+                output_bytes: 42_272,
+                total_placements: 333,
+            }
         );
         let _ = std::fs::remove_dir_all(dir);
     }

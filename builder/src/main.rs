@@ -13,8 +13,18 @@ fn main() -> ExitCode {
         Some("build-utxo-chunks") if args.len() == 4 || args.len() == 5 => {
             build_utxo_chunks(&args[2], &args[3], args.get(4))
         }
-        Some("build-index-cuckoo") if args.len() == 4 => build_index_cuckoo(&args[2], &args[3]),
-        Some("build-chunk-cuckoo") if args.len() == 4 => build_chunk_cuckoo(&args[2], &args[3]),
+        Some("build-index-cuckoo") if args.len() == 4 || args.len() == 6 => {
+            match parse_optional_anchor(&args, 4) {
+                Ok(anchor) => build_index_cuckoo(&args[2], &args[3], anchor),
+                Err(code) => code,
+            }
+        }
+        Some("build-chunk-cuckoo") if args.len() == 4 || args.len() == 6 => {
+            match parse_optional_anchor(&args, 4) {
+                Ok(anchor) => build_chunk_cuckoo(&args[2], &args[3], anchor),
+                Err(code) => code,
+            }
+        }
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -85,8 +95,23 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin>\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
+}
+
+fn parse_optional_anchor<'a>(
+    args: &'a [String],
+    start: usize,
+) -> Result<Option<&'a str>, ExitCode> {
+    if args.len() == start {
+        return Ok(None);
+    }
+    if args.len() == start + 2 && args[start] == "--anchor" {
+        return Ok(Some(&args[start + 1]));
+    }
+    eprintln!("error: expected optional argument shape: --anchor <chain_anchor.bin>");
+    usage(&args[0]);
+    Err(ExitCode::from(2))
 }
 
 fn build_utxo_chunks(flat_utxo_set: &str, out_dir: &str, partitions: Option<&String>) -> ExitCode {
@@ -125,12 +150,15 @@ fn build_utxo_chunks(flat_utxo_set: &str, out_dir: &str, partitions: Option<&Str
     }
 }
 
-fn build_index_cuckoo(index_file: &str, output_file: &str) -> ExitCode {
-    match dbpipeline::build_index_cuckoo(
-        index_file,
-        output_file,
-        &dbpipeline::IndexCuckooOptions::default(),
-    ) {
+fn build_index_cuckoo(index_file: &str, output_file: &str, anchor_path: Option<&str>) -> ExitCode {
+    let options = match index_cuckoo_options(anchor_path) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match dbpipeline::build_index_cuckoo(index_file, output_file, &options) {
         Ok(report) => {
             println!("index_entries={}", report.index_entries);
             println!("bins_per_table={}", report.bins_per_table);
@@ -146,12 +174,15 @@ fn build_index_cuckoo(index_file: &str, output_file: &str) -> ExitCode {
     }
 }
 
-fn build_chunk_cuckoo(chunks_file: &str, output_file: &str) -> ExitCode {
-    match dbpipeline::build_chunk_cuckoo(
-        chunks_file,
-        output_file,
-        &dbpipeline::ChunkCuckooOptions::default(),
-    ) {
+fn build_chunk_cuckoo(chunks_file: &str, output_file: &str, anchor_path: Option<&str>) -> ExitCode {
+    let options = match chunk_cuckoo_options(anchor_path) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match dbpipeline::build_chunk_cuckoo(chunks_file, output_file, &options) {
         Ok(report) => {
             println!("chunks={}", report.chunks);
             println!("bins_per_table={}", report.bins_per_table);
@@ -165,6 +196,72 @@ fn build_chunk_cuckoo(chunks_file: &str, output_file: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn index_cuckoo_options(
+    anchor_path: Option<&str>,
+) -> Result<dbpipeline::IndexCuckooOptions, String> {
+    match anchor_path {
+        Some(path) => {
+            let (anchor, seeds) = load_snapshot_seeds(path)?;
+            print_anchor_seed_source(&anchor);
+            println!("index_master_seed=0x{:016x}", seeds.index_master);
+            println!("index_tag_seed=0x{:016x}", seeds.index_tag);
+            Ok(dbpipeline::IndexCuckooOptions {
+                master_seed: seeds.index_master,
+                tag_seed: seeds.index_tag,
+            })
+        }
+        None => {
+            let options = dbpipeline::IndexCuckooOptions::default();
+            println!("seed_source=legacy");
+            println!("index_master_seed=0x{:016x}", options.master_seed);
+            println!("index_tag_seed=0x{:016x}", options.tag_seed);
+            Ok(options)
+        }
+    }
+}
+
+fn chunk_cuckoo_options(
+    anchor_path: Option<&str>,
+) -> Result<dbpipeline::ChunkCuckooOptions, String> {
+    match anchor_path {
+        Some(path) => {
+            let (anchor, seeds) = load_snapshot_seeds(path)?;
+            print_anchor_seed_source(&anchor);
+            println!("chunk_master_seed=0x{:016x}", seeds.chunk_master);
+            Ok(dbpipeline::ChunkCuckooOptions {
+                master_seed: seeds.chunk_master,
+            })
+        }
+        None => {
+            let options = dbpipeline::ChunkCuckooOptions::default();
+            println!("seed_source=legacy");
+            println!("chunk_master_seed=0x{:016x}", options.master_seed);
+            Ok(options)
+        }
+    }
+}
+
+fn load_snapshot_seeds(
+    path: &str,
+) -> Result<(rootbundle::ChainAnchor, rootbundle::SnapshotSeeds), String> {
+    let anchor = rootbundle::ChainAnchor::load(path)
+        .map_err(|e| format!("failed to read chain anchor {path}: {e}"))?;
+    let seeds = rootbundle::SnapshotSeeds::derive(&anchor);
+    Ok((anchor, seeds))
+}
+
+fn print_anchor_seed_source(anchor: &rootbundle::ChainAnchor) {
+    println!("seed_source=chain_anchor");
+    println!("anchor_height={}", anchor.height);
+    println!("anchor_hash={}", display_hash_hex(&anchor.block_hash));
+}
+
+fn display_hash_hex(internal: &[u8; 32]) -> String {
+    let mut h = *internal;
+    h.reverse();
+    hex::encode(h)
 }
 
 fn params_hash(index_bins: &str, chunk_bins: &str, onion_entry_size: &str) -> ExitCode {

@@ -16,11 +16,15 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io;
+use std::path::Path;
 
 /// Domain-separation prefix for bundle signatures. Versioned: any change
 /// to the payload layout must bump both this tag and `PAYLOAD_VERSION`.
 pub const SIGNING_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/root-bundle/v1\0";
 pub const PARAMS_HASH_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-params/v1\0";
+pub const SEED_TAG_PREFIX_V1: &[u8] = b"BitcoinPIR/seed/v1/";
 
 /// Payload layout version (field of the payload itself).
 pub const PAYLOAD_VERSION: u16 = 1;
@@ -28,6 +32,7 @@ pub const PAYLOAD_VERSION: u16 = 1;
 /// Hard caps keeping decode allocation-bounded.
 pub const MAX_ROOTS: usize = 1024;
 pub const MAX_LABEL_LEN: usize = 64;
+pub const CHAIN_ANCHOR_BYTES: usize = 36;
 
 /// What was built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +66,89 @@ impl BuildKind {
 pub struct ChainAnchor {
     pub block_hash: [u8; 32],
     pub height: u32,
+}
+
+impl ChainAnchor {
+    /// Serialize as `block_hash[32] || height_le[4]`, matching
+    /// `chain_anchor.bin` from the build pipeline.
+    pub fn to_bytes(&self) -> [u8; CHAIN_ANCHOR_BYTES] {
+        let mut out = [0u8; CHAIN_ANCHOR_BYTES];
+        out[..32].copy_from_slice(&self.block_hash);
+        out[32..].copy_from_slice(&self.height.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != CHAIN_ANCHOR_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ChainAnchor expects {} bytes, got {}",
+                    CHAIN_ANCHOR_BYTES,
+                    bytes.len()
+                ),
+            ));
+        }
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&bytes[..32]);
+        Ok(Self {
+            block_hash,
+            height: u32::from_le_bytes(bytes[32..].try_into().unwrap()),
+        })
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::from_bytes(&fs::read(path)?)
+    }
+}
+
+pub mod seed_domain {
+    pub const INDEX_CUCKOO_MASTER: &str = "index/cuckoo/master";
+    pub const CHUNK_CUCKOO_MASTER: &str = "chunk/cuckoo/master";
+    pub const INDEX_TAG_FINGERPRINT: &str = "index/tag/fingerprint";
+    pub const MERKLE_DATA_CUCKOO_MASTER: &str = "merkle/data/cuckoo/master";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotSeeds {
+    pub index_master: u64,
+    pub chunk_master: u64,
+    pub index_tag: u64,
+    pub merkle_data_master: u64,
+}
+
+impl SnapshotSeeds {
+    pub fn derive(anchor: &ChainAnchor) -> Self {
+        Self {
+            index_master: derive_snapshot_seed_u64(seed_domain::INDEX_CUCKOO_MASTER, anchor),
+            chunk_master: derive_snapshot_seed_u64(seed_domain::CHUNK_CUCKOO_MASTER, anchor),
+            index_tag: derive_snapshot_seed_u64(seed_domain::INDEX_TAG_FINGERPRINT, anchor),
+            merkle_data_master: derive_snapshot_seed_u64(
+                seed_domain::MERKLE_DATA_CUCKOO_MASTER,
+                anchor,
+            ),
+        }
+    }
+}
+
+pub fn derive_snapshot_seed_u64(domain: &str, anchor: &ChainAnchor) -> u64 {
+    let bytes = tagged_snapshot_seed_hash(domain, anchor);
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+
+fn tagged_snapshot_seed_hash(domain: &str, anchor: &ChainAnchor) -> [u8; 32] {
+    let mut tag_hasher = Sha256::new();
+    tag_hasher.update(SEED_TAG_PREFIX_V1);
+    tag_hasher.update(domain.as_bytes());
+    let tag_hash = tag_hasher.finalize();
+
+    let mut h = Sha256::new();
+    h.update(tag_hash);
+    h.update(tag_hash);
+    h.update(b"snapshot/");
+    h.update(anchor.height.to_le_bytes());
+    h.update(anchor.block_hash);
+    h.finalize().into()
 }
 
 /// One named Merkle root, e.g. `("dpf/index/super_root", …)`. Labels are
@@ -768,5 +856,38 @@ mod tests {
         assert_eq!(compute_dpf_n(565_684), 20);
         assert_eq!(compute_dpf_n(1_064_454), 21);
         assert_eq!(compute_dpf_n(10_000), 14);
+    }
+
+    #[test]
+    fn chain_anchor_bytes_roundtrip() {
+        let anchor = ChainAnchor {
+            block_hash: [0xab; 32],
+            height: 950_000,
+        };
+        let bytes = anchor.to_bytes();
+        assert_eq!(bytes.len(), CHAIN_ANCHOR_BYTES);
+        assert_eq!(ChainAnchor::from_bytes(&bytes).unwrap(), anchor);
+        assert!(ChainAnchor::from_bytes(&bytes[..35]).is_err());
+        assert!(ChainAnchor::from_bytes(&[0u8; 37]).is_err());
+    }
+
+    #[test]
+    fn snapshot_seed_vectors_match_pir_core_rule() {
+        let anchor = ChainAnchor {
+            block_hash: [0xab; 32],
+            height: 950_000,
+        };
+        let seeds = SnapshotSeeds::derive(&anchor);
+        assert_eq!(seeds.index_master, 0xe919_b727_bd4e_852b);
+        assert_eq!(seeds.chunk_master, 0x9ef8_8b24_8bd6_1a6e);
+        assert_eq!(seeds.index_tag, 0xb72a_9d06_a468_37d6);
+        assert_eq!(seeds.merkle_data_master, 0xbbf0_9e2f_95d1_e02c);
+
+        let mut different_height = anchor;
+        different_height.height += 1;
+        assert_ne!(
+            SnapshotSeeds::derive(&different_height).index_master,
+            seeds.index_master
+        );
     }
 }

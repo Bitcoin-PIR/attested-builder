@@ -60,8 +60,14 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `chunk_pir_cuckoo.bin`). Unlike the legacy `HashMap::drain()` binary,
   chunk groups are sorted by `script_hash` within each partition before
   writing, so output bytes do not depend on Rust's per-process hash-map
-  seed. The cuckoo stages currently use explicit/default seeds;
-  chain-anchor seed derivation is the next split-out step.
+  seed. The cuckoo stages accept explicit seeds; the CLI can either use
+  legacy defaults or derive INDEX/CHUNK/tag seeds from `chain_anchor.bin`
+  via the same `BitcoinPIR/seed/v1/` tagged-hash rule as the main repo.
+  Cuckoo table sizing starts at the legacy load-factor result and
+  deterministically increments `bins_per_table` if an unpredictable
+  chain-derived seed causes an insertion failure. Embedding anchors in
+  v2 cuckoo headers and splitting the Merkle stages are the next
+  pipeline cuts.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
