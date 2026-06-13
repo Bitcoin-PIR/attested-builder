@@ -26,8 +26,24 @@ pub const UTXO_CHUNKS_FILENAME: &str = "utxo_chunks_nodust.bin";
 pub const UTXO_CHUNKS_INDEX_FILENAME: &str = "utxo_chunks_index_nodust.bin";
 pub const TOP100_FILENAME: &str = "top100_addresses.bin";
 pub const WHALES_FILENAME: &str = "whale_addresses.txt";
+pub const INDEX_CUCKOO_FILENAME: &str = "batch_pir_cuckoo.bin";
+
+pub const INDEX_K: usize = 75;
+pub const INDEX_PBC_HASHES: usize = 3;
+pub const INDEX_SLOTS_PER_BIN: usize = 4;
+pub const INDEX_CUCKOO_HASHES: usize = 2;
+pub const INDEX_SLOT_SIZE: usize = 13;
+pub const INDEX_CUCKOO_HEADER_SIZE: usize = 40;
+pub const INDEX_CUCKOO_MAGIC: u64 = 0xBA7C_C000_C000_0004;
+pub const LEGACY_INDEX_MASTER_SEED: u64 = 0x71a2ef38b4c90d15;
+pub const LEGACY_INDEX_TAG_SEED: u64 = 0xd4e5f6a7b8c91023;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
+const CUCKOO_LOAD_FACTOR: f64 = 0.95;
+const CUCKOO_MAX_KICKS: usize = 10_000;
+const EMPTY: u32 = u32::MAX;
+const GOLDEN_RATIO: u64 = 0x9e3779b97f4a7c15;
+const CUCKOO_KEY_MIX: u64 = 0x517cc1b727220a95;
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -41,6 +57,13 @@ pub enum PipelineError {
     ChunkCountOverflow {
         script_hash: [u8; 20],
         chunks: usize,
+    },
+    InvalidIndexSize {
+        bytes: u64,
+    },
+    CuckooInsertFailed {
+        group_id: usize,
+        local_index: usize,
     },
 }
 
@@ -66,6 +89,19 @@ impl fmt::Display for PipelineError {
                 f,
                 "serialized group {} needs {chunks} chunks, exceeds u8",
                 hex::encode(script_hash)
+            ),
+            PipelineError::InvalidIndexSize { bytes } => {
+                write!(
+                    f,
+                    "index file size {bytes} is not divisible by {INDEX_RECORD_SIZE}"
+                )
+            }
+            PipelineError::CuckooInsertFailed {
+                group_id,
+                local_index,
+            } => write!(
+                f,
+                "cuckoo insertion failed for local entry {local_index} in group {group_id}"
             ),
         }
     }
@@ -108,6 +144,30 @@ pub struct UtxoChunkBuildReport {
     pub index_file_bytes: u64,
     pub data_bytes: u64,
     pub padding_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCuckooOptions {
+    pub master_seed: u64,
+    pub tag_seed: u64,
+}
+
+impl Default for IndexCuckooOptions {
+    fn default() -> Self {
+        Self {
+            master_seed: LEGACY_INDEX_MASTER_SEED,
+            tag_seed: LEGACY_INDEX_TAG_SEED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCuckooBuildReport {
+    pub index_entries: u64,
+    pub bins_per_table: u32,
+    pub slots_per_table: u64,
+    pub output_bytes: u64,
+    pub total_placements: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +246,133 @@ pub fn build_utxo_chunks(
             Err(e)
         }
     }
+}
+
+pub fn build_index_cuckoo(
+    index_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    options: &IndexCuckooOptions,
+) -> Result<IndexCuckooBuildReport, PipelineError> {
+    let index_path = index_path.as_ref();
+    let output_path = output_path.as_ref();
+    if output_path.exists() {
+        return Err(PipelineError::OutputExists(output_path.to_path_buf()));
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = temp_path(output_path);
+    if tmp_path.exists() {
+        return Err(PipelineError::OutputExists(tmp_path));
+    }
+
+    let result = build_index_cuckoo_inner(index_path, &tmp_path, options);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&tmp_path, output_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+fn build_index_cuckoo_inner(
+    index_path: &Path,
+    output_path: &Path,
+    options: &IndexCuckooOptions,
+) -> Result<IndexCuckooBuildReport, PipelineError> {
+    let data = std::fs::read(index_path)?;
+    if data.len() as u64 % INDEX_RECORD_SIZE as u64 != 0 {
+        return Err(PipelineError::InvalidIndexSize {
+            bytes: data.len() as u64,
+        });
+    }
+    let n = data.len() / INDEX_RECORD_SIZE;
+    let mut group_entries: Vec<Vec<usize>> = vec![Vec::new(); INDEX_K];
+    for i in 0..n {
+        let script_hash = &data[i * INDEX_RECORD_SIZE..i * INDEX_RECORD_SIZE + SCRIPT_HASH_SIZE];
+        for group in derive_groups_3(script_hash, INDEX_K) {
+            group_entries[group].push(i);
+        }
+    }
+
+    let max_load = group_entries.iter().map(Vec::len).max().unwrap_or(0);
+    let bins_per_table = compute_bins_per_table(max_load, INDEX_SLOTS_PER_BIN);
+    let slots_per_table = bins_per_table * INDEX_SLOTS_PER_BIN;
+
+    let mut tables = Vec::with_capacity(INDEX_K);
+    for (group_id, entries) in group_entries.iter().enumerate() {
+        tables.push(build_index_cuckoo_table(
+            &data,
+            entries,
+            group_id,
+            bins_per_table,
+            options.master_seed,
+        )?);
+    }
+
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(output_path)?);
+    write_index_cuckoo_header(&mut writer, bins_per_table as u32, options)?;
+    for group_id in 0..INDEX_K {
+        let entries = &group_entries[group_id];
+        let table = &tables[group_id];
+        for &local in table {
+            if local == EMPTY {
+                writer.write_all(&[0u8; INDEX_SLOT_SIZE])?;
+            } else {
+                let global_idx = entries[local as usize];
+                let offset = global_idx * INDEX_RECORD_SIZE;
+                let script_hash = &data[offset..offset + SCRIPT_HASH_SIZE];
+                let tag = compute_tag(options.tag_seed, script_hash);
+                writer.write_all(&tag.to_le_bytes())?;
+                writer.write_all(&data[offset + SCRIPT_HASH_SIZE..offset + INDEX_RECORD_SIZE])?;
+            }
+        }
+    }
+    writer.flush()?;
+
+    let output_bytes =
+        INDEX_CUCKOO_HEADER_SIZE as u64 + (INDEX_K * slots_per_table * INDEX_SLOT_SIZE) as u64;
+    Ok(IndexCuckooBuildReport {
+        index_entries: n as u64,
+        bins_per_table: bins_per_table as u32,
+        slots_per_table: slots_per_table as u64,
+        output_bytes,
+        total_placements: (n * INDEX_PBC_HASHES) as u64,
+    })
+}
+
+fn build_index_cuckoo_table(
+    index_data: &[u8],
+    entries: &[usize],
+    group_id: usize,
+    bins_per_table: usize,
+    master_seed: u64,
+) -> Result<Vec<u32>, PipelineError> {
+    let mut table = vec![EMPTY; bins_per_table * INDEX_SLOTS_PER_BIN];
+    let keys = [
+        derive_cuckoo_key(master_seed, group_id, 0),
+        derive_cuckoo_key(master_seed, group_id, 1),
+    ];
+    for local_index in 0..entries.len() {
+        if !cuckoo_insert_index(
+            &mut table,
+            index_data,
+            entries,
+            local_index,
+            &keys,
+            bins_per_table,
+        ) {
+            return Err(PipelineError::CuckooInsertFailed {
+                group_id,
+                local_index,
+            });
+        }
+    }
+    Ok(table)
 }
 
 fn build_utxo_chunks_inner(
@@ -315,6 +502,21 @@ fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
 }
 
+fn write_index_cuckoo_header<W: Write>(
+    writer: &mut W,
+    bins_per_table: u32,
+    options: &IndexCuckooOptions,
+) -> Result<(), PipelineError> {
+    writer.write_all(&INDEX_CUCKOO_MAGIC.to_le_bytes())?;
+    writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
+    writer.write_all(&(INDEX_SLOTS_PER_BIN as u32).to_le_bytes())?;
+    writer.write_all(&bins_per_table.to_le_bytes())?;
+    writer.write_all(&(INDEX_PBC_HASHES as u32).to_le_bytes())?;
+    writer.write_all(&options.master_seed.to_le_bytes())?;
+    writer.write_all(&options.tag_seed.to_le_bytes())?;
+    Ok(())
+}
+
 fn write_index_entry<W: Write>(
     writer: &mut W,
     script_hash: &[u8; SCRIPT_HASH_SIZE],
@@ -325,6 +527,140 @@ fn write_index_entry<W: Write>(
     writer.write_all(&start_chunk_id.to_le_bytes())?;
     writer.write_all(&[num_chunks])?;
     Ok(())
+}
+
+fn compute_bins_per_table(max_load: usize, slots_per_bin: usize) -> usize {
+    (max_load as f64 / (slots_per_bin as f64 * CUCKOO_LOAD_FACTOR)).ceil() as usize
+}
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    x
+}
+
+#[inline]
+fn sh_a(script_hash: &[u8]) -> u64 {
+    u64::from_le_bytes(script_hash[0..8].try_into().unwrap())
+}
+
+#[inline]
+fn sh_b(script_hash: &[u8]) -> u64 {
+    u64::from_le_bytes(script_hash[8..16].try_into().unwrap())
+}
+
+#[inline]
+fn sh_c(script_hash: &[u8]) -> u64 {
+    u32::from_le_bytes(script_hash[16..20].try_into().unwrap()) as u64
+}
+
+#[inline]
+fn hash_for_group(script_hash: &[u8], nonce: u64) -> u64 {
+    let mut h = sh_a(script_hash).wrapping_add(nonce.wrapping_mul(GOLDEN_RATIO));
+    h ^= sh_b(script_hash);
+    splitmix64(h ^ sh_c(script_hash))
+}
+
+fn derive_groups_3(script_hash: &[u8], k: usize) -> [usize; INDEX_PBC_HASHES] {
+    let mut groups = [0usize; INDEX_PBC_HASHES];
+    let mut nonce = 0u64;
+    let mut count = 0;
+    while count < INDEX_PBC_HASHES {
+        let group = (hash_for_group(script_hash, nonce) % k as u64) as usize;
+        nonce += 1;
+        if groups.iter().take(count).any(|&g| g == group) {
+            continue;
+        }
+        groups[count] = group;
+        count += 1;
+    }
+    groups
+}
+
+#[inline]
+fn derive_cuckoo_key(master_seed: u64, group_id: usize, hash_fn: usize) -> u64 {
+    splitmix64(
+        master_seed
+            .wrapping_add((group_id as u64).wrapping_mul(GOLDEN_RATIO))
+            .wrapping_add((hash_fn as u64).wrapping_mul(CUCKOO_KEY_MIX)),
+    )
+}
+
+#[inline]
+fn cuckoo_hash(script_hash: &[u8], key: u64, num_bins: usize) -> usize {
+    let mut h = sh_a(script_hash) ^ key;
+    h ^= sh_b(script_hash);
+    h = splitmix64(h ^ sh_c(script_hash));
+    (h % num_bins as u64) as usize
+}
+
+#[inline]
+fn compute_tag(tag_seed: u64, script_hash: &[u8]) -> u64 {
+    let mut h = sh_a(script_hash) ^ tag_seed;
+    h ^= sh_b(script_hash);
+    splitmix64(h ^ sh_c(script_hash))
+}
+
+fn cuckoo_insert_index(
+    table: &mut [u32],
+    index_data: &[u8],
+    entries: &[usize],
+    local_index: usize,
+    keys: &[u64; INDEX_CUCKOO_HASHES],
+    bins_per_table: usize,
+) -> bool {
+    let hash_fn = |idx: usize, hf: usize| -> usize {
+        let global_idx = entries[idx];
+        let offset = global_idx * INDEX_RECORD_SIZE;
+        let script_hash = &index_data[offset..offset + SCRIPT_HASH_SIZE];
+        cuckoo_hash(script_hash, keys[hf], bins_per_table)
+    };
+
+    for hf in 0..INDEX_CUCKOO_HASHES {
+        let bin = hash_fn(local_index, hf);
+        let base = bin * INDEX_SLOTS_PER_BIN;
+        for s in 0..INDEX_SLOTS_PER_BIN {
+            if table[base + s] == EMPTY {
+                table[base + s] = local_index as u32;
+                return true;
+            }
+        }
+    }
+
+    let mut current = local_index;
+    let mut current_bin = hash_fn(current, 0);
+    for kick in 0..CUCKOO_MAX_KICKS {
+        let base = current_bin * INDEX_SLOTS_PER_BIN;
+        let evict_slot = kick % INDEX_SLOTS_PER_BIN;
+        let evicted = table[base + evict_slot] as usize;
+        table[base + evict_slot] = current as u32;
+
+        let mut alt_bin = current_bin;
+        for hf in 0..INDEX_CUCKOO_HASHES {
+            let bin = hash_fn(evicted, hf);
+            if bin != current_bin {
+                alt_bin = bin;
+                break;
+            }
+        }
+
+        let alt_base = alt_bin * INDEX_SLOTS_PER_BIN;
+        for s in 0..INDEX_SLOTS_PER_BIN {
+            if table[alt_base + s] == EMPTY {
+                table[alt_base + s] = evicted as u32;
+                return true;
+            }
+        }
+
+        current = evicted;
+        current_bin = alt_bin;
+    }
+
+    false
 }
 
 fn push_top_entry(heap: &mut BinaryHeap<Reverse<TopEntry>>, entry: TopEntry) {
@@ -498,6 +834,46 @@ mod tests {
                 "{file} differs across repeated builds"
             );
         }
+
+        let cuckoo1 = dir.join("index-cuckoo-1.bin");
+        let cuckoo2 = dir.join("index-cuckoo-2.bin");
+        let cuckoo_options = IndexCuckooOptions::default();
+        let cuckoo_report1 = build_index_cuckoo(
+            out1.join(UTXO_CHUNKS_INDEX_FILENAME),
+            &cuckoo1,
+            &cuckoo_options,
+        )
+        .expect("build index cuckoo 1");
+        let cuckoo_report2 = build_index_cuckoo(
+            out2.join(UTXO_CHUNKS_INDEX_FILENAME),
+            &cuckoo2,
+            &cuckoo_options,
+        )
+        .expect("build index cuckoo 2");
+        let expected_cuckoo = IndexCuckooBuildReport {
+            index_entries: 9,
+            bins_per_table: 1,
+            slots_per_table: 4,
+            output_bytes: 3_940,
+            total_placements: 27,
+        };
+        assert_eq!(cuckoo_report1, expected_cuckoo);
+        assert_eq!(cuckoo_report2, expected_cuckoo);
+        let cuckoo_bytes1 = std::fs::read(&cuckoo1).unwrap();
+        let cuckoo_bytes2 = std::fs::read(&cuckoo2).unwrap();
+        assert_eq!(cuckoo_bytes1, cuckoo_bytes2);
+        assert_eq!(
+            u64::from_le_bytes(cuckoo_bytes1[0..8].try_into().unwrap()),
+            INDEX_CUCKOO_MAGIC
+        );
+        assert_eq!(
+            u64::from_le_bytes(cuckoo_bytes1[24..32].try_into().unwrap()),
+            LEGACY_INDEX_MASTER_SEED
+        );
+        assert_eq!(
+            u64::from_le_bytes(cuckoo_bytes1[32..40].try_into().unwrap()),
+            LEGACY_INDEX_TAG_SEED
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

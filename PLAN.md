@@ -54,9 +54,13 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `build/` binaries. Currently includes `build_utxo_chunks`: verified
   flat `utxo_set.bin` → `utxo_chunks_nodust.bin`,
   `utxo_chunks_index_nodust.bin`, top-100 metadata, and whale metadata.
-  Unlike the legacy `HashMap::drain()` binary, groups are sorted by
+  It also includes the INDEX cuckoo/PBC table builder
+  (`utxo_chunks_index_nodust.bin` → `batch_pir_cuckoo.bin`). Unlike the
+  legacy `HashMap::drain()` binary, chunk groups are sorted by
   `script_hash` within each partition before writing, so output bytes do
-  not depend on Rust's per-process hash-map seed.
+  not depend on Rust's per-process hash-map seed. The INDEX cuckoo stage
+  currently uses explicit/default seeds; chain-anchor seed derivation is
+  the next split-out step.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
