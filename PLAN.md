@@ -68,8 +68,12 @@ enclave-resident with pinned PCRs; browsers never parse them.
   chain-derived seed causes an insertion failure. When the CLI is given
   `--anchor`, INDEX/CHUNK cuckoo files use snapshot v2 headers (legacy
   magic XOR `0x0000000100000000`, then a 36-byte `chain_anchor.bin`
-  trailer after the legacy header). Splitting the Merkle stages is the
-  next pipeline cut.
+  trailer after the legacy header). The DPF/Harmony bucket-Merkle stage
+  is also split out: `batch_pir_cuckoo.bin` + `chunk_pir_cuckoo.bin` →
+  `merkle_bucket_{tree_tops,roots,root}.bin` plus any low-level
+  sibling tables needed when a tree exceeds the 1024-node tree-top
+  threshold. Splitting the Onion Merkle/Onion table stages is the next
+  pipeline cut.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

@@ -129,6 +129,7 @@ name = "dbpipeline"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "sha2",
  "utxosnapshot",
 ]
 

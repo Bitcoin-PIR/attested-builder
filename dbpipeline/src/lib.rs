@@ -13,6 +13,8 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 pub const FLAT_UTXO_ENTRY_SIZE: usize = utxosnapshot::FLAT_UTXO_ENTRY_SIZE as usize;
 pub const SCRIPT_HASH_SIZE: usize = 20;
 pub const TXID_SIZE: usize = 32;
@@ -50,12 +52,23 @@ pub const LEGACY_CHUNK_MASTER_SEED: u64 = 0xa3f7c2d918e4b065;
 pub const CHAIN_ANCHOR_BYTES: usize = 36;
 pub const ANCHOR_MAGIC_SNAPSHOT_XOR: u64 = 0x0000_0001_0000_0000;
 
+pub const MERKLE_ARITY: usize = 8;
+pub const MERKLE_HASH_SIZE: usize = 32;
+pub const MERKLE_SIB_ROW_SIZE: usize = MERKLE_ARITY * MERKLE_HASH_SIZE;
+pub const MERKLE_TREE_TOP_THRESHOLD: usize = 1024;
+pub const MERKLE_BUCKET_TREE_TOPS_FILENAME: &str = "merkle_bucket_tree_tops.bin";
+pub const MERKLE_BUCKET_ROOTS_FILENAME: &str = "merkle_bucket_roots.bin";
+pub const MERKLE_BUCKET_ROOT_FILENAME: &str = "merkle_bucket_root.bin";
+
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
+const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
 const CUCKOO_LOAD_FACTOR: f64 = 0.95;
 const CUCKOO_MAX_KICKS: usize = 10_000;
 const EMPTY: u32 = u32::MAX;
 const GOLDEN_RATIO: u64 = 0x9e3779b97f4a7c15;
 const CUCKOO_KEY_MIX: u64 = 0x517cc1b727220a95;
+
+type Hash256 = [u8; MERKLE_HASH_SIZE];
 
 #[derive(Debug)]
 pub enum PipelineError {
@@ -79,6 +92,15 @@ pub enum PipelineError {
     CuckooInsertFailed {
         group_id: usize,
         local_index: usize,
+    },
+    InvalidCuckooHeader {
+        path: PathBuf,
+        reason: String,
+    },
+    InvalidCuckooBody {
+        path: PathBuf,
+        expected_bytes: u64,
+        actual_bytes: u64,
     },
 }
 
@@ -123,6 +145,18 @@ impl fmt::Display for PipelineError {
             } => write!(
                 f,
                 "cuckoo insertion failed for local entry {local_index} in group {group_id}"
+            ),
+            PipelineError::InvalidCuckooHeader { path, reason } => {
+                write!(f, "invalid cuckoo header {}: {reason}", path.display())
+            }
+            PipelineError::InvalidCuckooBody {
+                path,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "invalid cuckoo body {}: expected {expected_bytes} bytes, got {actual_bytes}",
+                path.display()
             ),
         }
     }
@@ -217,6 +251,18 @@ pub struct ChunkCuckooBuildReport {
     pub total_placements: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketMerkleBuildReport {
+    pub index_bins_per_table: u32,
+    pub chunk_bins_per_table: u32,
+    pub index_sibling_levels: Vec<u32>,
+    pub chunk_sibling_levels: Vec<u32>,
+    pub tree_count: u32,
+    pub tree_tops_file_bytes: u64,
+    pub roots_file_bytes: u64,
+    pub super_root: [u8; MERKLE_HASH_SIZE],
+}
+
 #[derive(Debug, Clone)]
 struct FlatEntry {
     script_hash: [u8; SCRIPT_HASH_SIZE],
@@ -235,6 +281,18 @@ struct ShortenedEntry {
 }
 
 type TopEntry = (usize, [u8; SCRIPT_HASH_SIZE], [u8; TXID_SIZE], u32);
+
+#[derive(Debug, Clone)]
+struct CuckooTableMeta {
+    bins_per_table: usize,
+    header_size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PerGroupTree {
+    levels: Vec<Vec<Hash256>>,
+    root: Hash256,
+}
 
 pub fn build_utxo_chunks(
     flat_utxo_path: impl AsRef<Path>,
@@ -352,6 +410,100 @@ pub fn build_chunk_cuckoo(
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+pub fn build_bucket_merkle(
+    index_cuckoo_path: impl AsRef<Path>,
+    chunk_cuckoo_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+) -> Result<BucketMerkleBuildReport, PipelineError> {
+    let index_cuckoo_path = index_cuckoo_path.as_ref();
+    let chunk_cuckoo_path = chunk_cuckoo_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let index_data = std::fs::read(index_cuckoo_path)?;
+    let chunk_data = std::fs::read(chunk_cuckoo_path)?;
+    let index_meta = parse_cuckoo_meta(
+        index_cuckoo_path,
+        &index_data,
+        INDEX_CUCKOO_MAGIC,
+        INDEX_CUCKOO_HEADER_SIZE,
+        INDEX_K,
+        INDEX_SLOTS_PER_BIN,
+        INDEX_PBC_HASHES,
+    )?;
+    let chunk_meta = parse_cuckoo_meta(
+        chunk_cuckoo_path,
+        &chunk_data,
+        CHUNK_CUCKOO_MAGIC,
+        CHUNK_CUCKOO_HEADER_SIZE,
+        CHUNK_K,
+        CHUNK_SLOTS_PER_BIN,
+        CHUNK_PBC_HASHES,
+    )?;
+    validate_cuckoo_body(
+        index_cuckoo_path,
+        index_data.len(),
+        &index_meta,
+        INDEX_K,
+        INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE,
+    )?;
+    validate_cuckoo_body(
+        chunk_cuckoo_path,
+        chunk_data.len(),
+        &chunk_meta,
+        CHUNK_K,
+        CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE,
+    )?;
+
+    let index_sibling_levels = compute_sibling_levels(index_meta.bins_per_table);
+    let chunk_sibling_levels = compute_sibling_levels(chunk_meta.bins_per_table);
+    let mut output_paths = vec![
+        out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME),
+        out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME),
+        out_dir.join(MERKLE_BUCKET_ROOT_FILENAME),
+    ];
+    for level in 0..index_sibling_levels.len() {
+        output_paths.push(out_dir.join(merkle_index_sibling_filename(level)));
+    }
+    for level in 0..chunk_sibling_levels.len() {
+        output_paths.push(out_dir.join(merkle_chunk_sibling_filename(level)));
+    }
+    for path in &output_paths {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+        let tmp = temp_path(path);
+        if tmp.exists() {
+            return Err(PipelineError::OutputExists(tmp));
+        }
+    }
+
+    let result = build_bucket_merkle_inner(
+        &index_data,
+        &chunk_data,
+        &index_meta,
+        &chunk_meta,
+        out_dir,
+        &index_sibling_levels,
+        &chunk_sibling_levels,
+    );
+
+    match result {
+        Ok(report) => {
+            for path in output_paths {
+                std::fs::rename(temp_path(&path), path)?;
+            }
+            Ok(report)
+        }
+        Err(e) => {
+            for path in output_paths {
+                let _ = std::fs::remove_file(temp_path(&path));
+            }
             Err(e)
         }
     }
@@ -559,6 +711,356 @@ fn build_chunk_cuckoo_table(
         }
     }
     Ok(table)
+}
+
+fn build_bucket_merkle_inner(
+    index_data: &[u8],
+    chunk_data: &[u8],
+    index_meta: &CuckooTableMeta,
+    chunk_meta: &CuckooTableMeta,
+    out_dir: &Path,
+    index_sibling_levels: &[usize],
+    chunk_sibling_levels: &[usize],
+) -> Result<BucketMerkleBuildReport, PipelineError> {
+    let index_bin_size = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
+    let chunk_bin_size = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
+
+    let index_trees: Vec<PerGroupTree> = (0..INDEX_K)
+        .map(|group_id| {
+            build_group_tree(
+                index_data,
+                index_meta.header_size,
+                group_id,
+                index_meta.bins_per_table,
+                index_bin_size,
+            )
+        })
+        .collect();
+    let chunk_trees: Vec<PerGroupTree> = (0..CHUNK_K)
+        .map(|group_id| {
+            build_group_tree(
+                chunk_data,
+                chunk_meta.header_size,
+                group_id,
+                chunk_meta.bins_per_table,
+                chunk_bin_size,
+            )
+        })
+        .collect();
+
+    for (level_idx, &num_groups) in index_sibling_levels.iter().enumerate() {
+        write_flat_sibling_table(
+            &temp_path(&out_dir.join(merkle_index_sibling_filename(level_idx))),
+            &index_trees,
+            level_idx,
+            num_groups,
+            INDEX_K,
+            bucket_sib_magic(0, level_idx as u8),
+        )?;
+    }
+    for (level_idx, &num_groups) in chunk_sibling_levels.iter().enumerate() {
+        write_flat_sibling_table(
+            &temp_path(&out_dir.join(merkle_chunk_sibling_filename(level_idx))),
+            &chunk_trees,
+            level_idx,
+            num_groups,
+            CHUNK_K,
+            bucket_sib_magic(1, level_idx as u8),
+        )?;
+    }
+
+    let tree_tops_path = temp_path(&out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
+    write_tree_tops(
+        &tree_tops_path,
+        &index_trees,
+        &chunk_trees,
+        index_sibling_levels,
+        chunk_sibling_levels,
+    )?;
+
+    let mut roots = Vec::with_capacity(INDEX_K + CHUNK_K);
+    roots.extend(index_trees.iter().map(|tree| tree.root));
+    roots.extend(chunk_trees.iter().map(|tree| tree.root));
+
+    let roots_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME));
+    write_roots(&roots_path, &roots)?;
+
+    let mut super_preimage = Vec::with_capacity(roots.len() * MERKLE_HASH_SIZE);
+    for root in &roots {
+        super_preimage.extend_from_slice(root);
+    }
+    let super_root = sha256(&super_preimage);
+    let super_root_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOT_FILENAME));
+    std::fs::write(&super_root_path, super_root)?;
+
+    Ok(BucketMerkleBuildReport {
+        index_bins_per_table: index_meta.bins_per_table as u32,
+        chunk_bins_per_table: chunk_meta.bins_per_table as u32,
+        index_sibling_levels: index_sibling_levels.iter().map(|&n| n as u32).collect(),
+        chunk_sibling_levels: chunk_sibling_levels.iter().map(|&n| n as u32).collect(),
+        tree_count: (INDEX_K + CHUNK_K) as u32,
+        tree_tops_file_bytes: std::fs::metadata(&tree_tops_path)?.len(),
+        roots_file_bytes: std::fs::metadata(&roots_path)?.len(),
+        super_root,
+    })
+}
+
+fn parse_cuckoo_meta(
+    path: &Path,
+    data: &[u8],
+    expected_magic: u64,
+    legacy_header_size: usize,
+    expected_k: usize,
+    expected_slots_per_bin: usize,
+    expected_num_hashes: usize,
+) -> Result<CuckooTableMeta, PipelineError> {
+    if data.len() < legacy_header_size {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!("file too small for {legacy_header_size}-byte header"),
+        });
+    }
+    let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let legacy_magic = expected_magic;
+    let snapshot_magic = expected_magic ^ ANCHOR_MAGIC_SNAPSHOT_XOR;
+    let anchor_len = if magic == legacy_magic {
+        0
+    } else if magic == snapshot_magic {
+        CHAIN_ANCHOR_BYTES
+    } else {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!(
+                "bad magic 0x{magic:016x}; expected legacy 0x{legacy_magic:016x} or snapshot v2 0x{snapshot_magic:016x}"
+            ),
+        });
+    };
+    let header_size = legacy_header_size + anchor_len;
+    if data.len() < header_size {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!("truncated v2 header: need {header_size} bytes"),
+        });
+    }
+    let k = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    let slots_per_bin = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+    let bins_per_table = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    let num_hashes = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+    if k != expected_k {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!("k={k}, expected {expected_k}"),
+        });
+    }
+    if slots_per_bin != expected_slots_per_bin {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!("slots_per_bin={slots_per_bin}, expected {expected_slots_per_bin}"),
+        });
+    }
+    if num_hashes != expected_num_hashes {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: format!("num_hashes={num_hashes}, expected {expected_num_hashes}"),
+        });
+    }
+    if bins_per_table == 0 {
+        return Err(PipelineError::InvalidCuckooHeader {
+            path: path.to_path_buf(),
+            reason: "bins_per_table must be nonzero".into(),
+        });
+    }
+    Ok(CuckooTableMeta {
+        bins_per_table,
+        header_size,
+    })
+}
+
+fn validate_cuckoo_body(
+    path: &Path,
+    actual_bytes: usize,
+    meta: &CuckooTableMeta,
+    k: usize,
+    bin_size: usize,
+) -> Result<(), PipelineError> {
+    let expected_bytes = meta.header_size + k * meta.bins_per_table * bin_size;
+    if actual_bytes != expected_bytes {
+        return Err(PipelineError::InvalidCuckooBody {
+            path: path.to_path_buf(),
+            expected_bytes: expected_bytes as u64,
+            actual_bytes: actual_bytes as u64,
+        });
+    }
+    Ok(())
+}
+
+fn build_group_tree(
+    table_data: &[u8],
+    data_offset: usize,
+    group_id: usize,
+    bins_per_table: usize,
+    bin_size: usize,
+) -> PerGroupTree {
+    let table_byte_size = bins_per_table * bin_size;
+    let group_offset = data_offset + group_id * table_byte_size;
+    let group_data = &table_data[group_offset..group_offset + table_byte_size];
+
+    let mut levels = Vec::new();
+    let leaves: Vec<Hash256> = (0..bins_per_table)
+        .map(|i| {
+            let bin_start = i * bin_size;
+            compute_bin_leaf_hash(i as u32, &group_data[bin_start..bin_start + bin_size])
+        })
+        .collect();
+    levels.push(leaves);
+
+    loop {
+        let prev = levels.last().unwrap();
+        if prev.len() <= 1 {
+            break;
+        }
+        let mut next = Vec::with_capacity(prev.len().div_ceil(MERKLE_ARITY));
+        for i in 0..prev.len().div_ceil(MERKLE_ARITY) {
+            let start = i * MERKLE_ARITY;
+            let end = (start + MERKLE_ARITY).min(prev.len());
+            let mut children = prev[start..end].to_vec();
+            children.resize(MERKLE_ARITY, ZERO_HASH);
+            next.push(compute_parent_n(&children));
+        }
+        levels.push(next);
+    }
+
+    let root = levels.last().unwrap()[0];
+    PerGroupTree { levels, root }
+}
+
+fn compute_sibling_levels(bins_per_table: usize) -> Vec<usize> {
+    let mut levels = Vec::new();
+    let mut nodes_at_level = bins_per_table;
+    loop {
+        let num_groups = nodes_at_level.div_ceil(MERKLE_ARITY);
+        if num_groups <= MERKLE_TREE_TOP_THRESHOLD {
+            break;
+        }
+        levels.push(num_groups);
+        nodes_at_level = num_groups;
+    }
+    levels
+}
+
+fn write_flat_sibling_table(
+    path: &Path,
+    trees: &[PerGroupTree],
+    level_idx: usize,
+    num_groups: usize,
+    k: usize,
+    magic: u64,
+) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create_new(path)?);
+    writer.write_all(&magic.to_le_bytes())?;
+    writer.write_all(&(k as u32).to_le_bytes())?;
+    writer.write_all(&1u32.to_le_bytes())?;
+    writer.write_all(&(num_groups as u32).to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?;
+    writer.write_all(&0u64.to_le_bytes())?;
+
+    for tree in trees.iter().take(k) {
+        let children_level = &tree.levels[level_idx];
+        for row in 0..num_groups {
+            let start = row * MERKLE_ARITY;
+            for child in 0..MERKLE_ARITY {
+                let idx = start + child;
+                if idx < children_level.len() {
+                    writer.write_all(&children_level[idx])?;
+                } else {
+                    writer.write_all(&ZERO_HASH)?;
+                }
+            }
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_tree_tops(
+    path: &Path,
+    index_trees: &[PerGroupTree],
+    chunk_trees: &[PerGroupTree],
+    index_sibling_levels: &[usize],
+    chunk_sibling_levels: &[usize],
+) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(path)?);
+    writer.write_all(&((index_trees.len() + chunk_trees.len()) as u32).to_le_bytes())?;
+    for tree in index_trees {
+        write_one_tree_top(&mut writer, tree, index_sibling_levels.len())?;
+    }
+    for tree in chunk_trees {
+        write_one_tree_top(&mut writer, tree, chunk_sibling_levels.len())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_one_tree_top<W: Write>(
+    writer: &mut W,
+    tree: &PerGroupTree,
+    cache_from_level: usize,
+) -> Result<(), PipelineError> {
+    let num_cached_levels = tree.levels.len().saturating_sub(cache_from_level);
+    let total_nodes: usize = tree.levels[cache_from_level..].iter().map(Vec::len).sum();
+    writer.write_all(&[cache_from_level as u8])?;
+    writer.write_all(&(total_nodes as u32).to_le_bytes())?;
+    writer.write_all(&(MERKLE_ARITY as u16).to_le_bytes())?;
+    writer.write_all(&[num_cached_levels as u8])?;
+    for level in &tree.levels[cache_from_level..] {
+        writer.write_all(&(level.len() as u32).to_le_bytes())?;
+        for hash in level {
+            writer.write_all(hash)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_roots(path: &Path, roots: &[Hash256]) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::new(File::create_new(path)?);
+    for root in roots {
+        writer.write_all(root)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn bucket_sib_magic(table_type: u8, level: u8) -> u64 {
+    0xBA7C_B000_0000_0000u64 | ((table_type as u64) << 40) | ((level as u64) << 16)
+}
+
+fn merkle_index_sibling_filename(level: usize) -> String {
+    format!("merkle_bucket_index_sib_L{level}.bin")
+}
+
+fn merkle_chunk_sibling_filename(level: usize) -> String {
+    format!("merkle_bucket_chunk_sib_L{level}.bin")
+}
+
+fn compute_bin_leaf_hash(bin_index: u32, bin_content: &[u8]) -> Hash256 {
+    let mut preimage = Vec::with_capacity(4 + bin_content.len());
+    preimage.extend_from_slice(&bin_index.to_le_bytes());
+    preimage.extend_from_slice(bin_content);
+    sha256(&preimage)
+}
+
+fn compute_parent_n(children: &[Hash256]) -> Hash256 {
+    let mut preimage = Vec::with_capacity(children.len() * MERKLE_HASH_SIZE);
+    for child in children {
+        preimage.extend_from_slice(child);
+    }
+    sha256(&preimage)
+}
+
+fn sha256(data: &[u8]) -> Hash256 {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
 }
 
 fn build_utxo_chunks_inner(
@@ -1285,7 +1787,65 @@ mod tests {
                 [CHUNK_CUCKOO_HEADER_SIZE..CHUNK_CUCKOO_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
             &regtest_anchor
         );
+
+        let merkle_legacy = dir.join("merkle-legacy");
+        let merkle_legacy_report = build_bucket_merkle(&cuckoo1, &chunk_cuckoo1, &merkle_legacy)
+            .expect("build legacy bucket merkle");
+        assert_eq!(
+            merkle_legacy_report,
+            BucketMerkleBuildReport {
+                index_bins_per_table: 1,
+                chunk_bins_per_table: 3,
+                index_sibling_levels: Vec::new(),
+                chunk_sibling_levels: Vec::new(),
+                tree_count: 155,
+                tree_tops_file_bytes: 14_824,
+                roots_file_bytes: 4_960,
+                super_root: hash_from_hex(
+                    "3f9333950fe369352657c354951f2cfb217cd5726fc406299a01aad90a6fd714"
+                ),
+            }
+        );
+        assert!(merkle_legacy
+            .join(MERKLE_BUCKET_TREE_TOPS_FILENAME)
+            .exists());
+        assert!(merkle_legacy.join(MERKLE_BUCKET_ROOTS_FILENAME).exists());
+        assert!(merkle_legacy.join(MERKLE_BUCKET_ROOT_FILENAME).exists());
+        assert!(!merkle_legacy
+            .join(merkle_index_sibling_filename(0))
+            .exists());
+        assert!(!merkle_legacy
+            .join(merkle_chunk_sibling_filename(0))
+            .exists());
+
+        let merkle_anchor = dir.join("merkle-anchor");
+        let merkle_anchor_report = build_bucket_merkle(
+            &anchored_index_cuckoo,
+            &anchor_seed_chunk_cuckoo,
+            &merkle_anchor,
+        )
+        .expect("build anchored bucket merkle");
+        assert_eq!(
+            merkle_anchor_report,
+            BucketMerkleBuildReport {
+                index_bins_per_table: 1,
+                chunk_bins_per_table: 4,
+                index_sibling_levels: Vec::new(),
+                chunk_sibling_levels: Vec::new(),
+                tree_count: 155,
+                tree_tops_file_bytes: 17_384,
+                roots_file_bytes: 4_960,
+                super_root: hash_from_hex(
+                    "d75ea9f795defe239a08f371a2954b0e2150ee72bc65612ecdfa27b0f8a5a280"
+                ),
+            }
+        );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn hash_from_hex(s: &str) -> Hash256 {
+        let bytes = hex::decode(s).unwrap();
+        bytes.try_into().unwrap()
     }
 
     fn fresh_temp_dir(label: &str) -> PathBuf {

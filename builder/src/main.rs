@@ -25,6 +25,9 @@ fn main() -> ExitCode {
                 Err(code) => code,
             }
         }
+        Some("build-bucket-merkle") if args.len() == 5 => {
+            build_bucket_merkle(&args[2], &args[3], &args[4])
+        }
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -95,7 +98,7 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
 }
 
@@ -189,6 +192,26 @@ fn build_chunk_cuckoo(chunks_file: &str, output_file: &str, anchor_path: Option<
             println!("slots_per_table={}", report.slots_per_table);
             println!("total_placements={}", report.total_placements);
             println!("output_bytes={}", report.output_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn build_bucket_merkle(index_cuckoo: &str, chunk_cuckoo: &str, out_dir: &str) -> ExitCode {
+    match dbpipeline::build_bucket_merkle(index_cuckoo, chunk_cuckoo, out_dir) {
+        Ok(report) => {
+            println!("index_bins_per_table={}", report.index_bins_per_table);
+            println!("chunk_bins_per_table={}", report.chunk_bins_per_table);
+            println!("index_sibling_levels={:?}", report.index_sibling_levels);
+            println!("chunk_sibling_levels={:?}", report.chunk_sibling_levels);
+            println!("tree_count={}", report.tree_count);
+            println!("tree_tops_file_bytes={}", report.tree_tops_file_bytes);
+            println!("roots_file_bytes={}", report.roots_file_bytes);
+            println!("super_root={}", hex::encode(report.super_root));
             ExitCode::SUCCESS
         }
         Err(e) => {

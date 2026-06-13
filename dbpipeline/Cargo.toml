@@ -7,4 +7,5 @@ description = "Deterministic BitcoinPIR database build pipeline stages"
 
 [dependencies]
 hex = "=0.4.3"
+sha2 = { version = "=0.10.9", default-features = false }
 utxosnapshot = { path = "../utxosnapshot" }
