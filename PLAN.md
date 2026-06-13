@@ -45,6 +45,18 @@ enclave-resident with pinned PCRs; browsers never parse them.
   K/K_CHUNK/bin-count/format blob), and a sorted list of named Merkle
   roots. Domain-separated Ed25519 signing, strict canonical
   encode/decode, `verify_quorum(trusted, threshold)`.
+- `utxosnapshot/` — Core v2 `dumptxoutset` parser and MuHash verifier.
+  It decodes the compressed snapshot coin format, then hashes the Core
+  v31 `TxOutSer` preimage (`COutPoint || uint32(code) || CTxOut`) used
+  by `gettxoutsetinfo muhash`. The committed regtest fixture is an
+  end-to-end golden test.
+- `dbpipeline/` — deterministic build stages split out of the legacy
+  `build/` binaries. Currently includes `build_utxo_chunks`: verified
+  flat `utxo_set.bin` → `utxo_chunks_nodust.bin`,
+  `utxo_chunks_index_nodust.bin`, top-100 metadata, and whale metadata.
+  Unlike the legacy `HashMap::drain()` binary, groups are sorted by
+  `script_hash` within each partition before writing, so output bytes do
+  not depend on Rust's per-process hash-map seed.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

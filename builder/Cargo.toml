@@ -10,6 +10,7 @@ name = "pir-attested-builder"
 path = "src/main.rs"
 
 [dependencies]
+dbpipeline = { path = "../dbpipeline" }
 hex = "=0.4.3"
 rootbundle = { path = "../rootbundle" }
 utxosnapshot = { path = "../utxosnapshot" }

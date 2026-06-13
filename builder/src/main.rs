@@ -10,6 +10,9 @@ fn main() -> ExitCode {
             materialize_utxo_set(&args[2], &args[3], &args[4], &args[5], &args[6])
         }
         Some("params-hash") if args.len() == 5 => params_hash(&args[2], &args[3], &args[4]),
+        Some("build-utxo-chunks") if args.len() == 4 || args.len() == 5 => {
+            build_utxo_chunks(&args[2], &args[3], args.get(4))
+        }
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -80,8 +83,44 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
+}
+
+fn build_utxo_chunks(flat_utxo_set: &str, out_dir: &str, partitions: Option<&String>) -> ExitCode {
+    let partitions = match partitions {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("error: partitions must be a positive integer: {s}");
+                return ExitCode::from(2);
+            }
+        },
+        None => dbpipeline::UtxoChunkBuildOptions::default().partitions,
+    };
+    let options = dbpipeline::UtxoChunkBuildOptions {
+        partitions,
+        ..Default::default()
+    };
+    match dbpipeline::build_utxo_chunks(flat_utxo_set, out_dir, &options) {
+        Ok(report) => {
+            println!("input_entries={}", report.input_entries);
+            println!("dust_utxos_skipped={}", report.dust_utxos_skipped);
+            println!("whale_spks_excluded={}", report.whale_spks_excluded);
+            println!("groups_written={}", report.groups_written);
+            println!("index_entries={}", report.index_entries);
+            println!("chunks_written={}", report.chunks_written);
+            println!("chunks_file_bytes={}", report.chunks_file_bytes);
+            println!("index_file_bytes={}", report.index_file_bytes);
+            println!("data_bytes={}", report.data_bytes);
+            println!("padding_bytes={}", report.padding_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn params_hash(index_bins: &str, chunk_bins: &str, onion_entry_size: &str) -> ExitCode {
