@@ -65,9 +65,16 @@ pub const ONION_PACKED_ENTRIES_FILENAME: &str = "onion_packed_entries.bin";
 pub const ONION_INDEX_FILENAME: &str = "onion_index.bin";
 pub const ONION_CHUNK_CUCKOO_FILENAME: &str = "onion_chunk_cuckoo.bin";
 pub const ONION_DATA_BIN_HASHES_FILENAME: &str = "onion_data_bin_hashes.bin";
+pub const ONION_INDEX_BINS_FILENAME: &str = "onion_index_bins.bin";
+pub const ONION_INDEX_META_FILENAME: &str = "onion_index_meta.bin";
+pub const ONION_INDEX_BIN_HASHES_FILENAME: &str = "onion_index_bin_hashes.bin";
 pub const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1;
 pub const DEFAULT_ONION_ENTRY_SIZE: usize = 3_328;
 pub const ONION_WHALE_FLAG: u8 = 0x40;
+pub const ONION_INDEX_SLOT_SIZE: usize = 8 + 4 + 2 + 1;
+pub const ONION_INDEX_CUCKOO_HASHES: usize = 2;
+pub const ONION_INDEX_META_HEADER_SIZE: usize = 44;
+pub const ONION_INDEX_META_MAGIC: u64 = 0xBA7C_0010_0000_0002;
 pub const ONION_DATA_CUCKOO_HASHES: usize = 6;
 pub const ONION_DATA_CUCKOO_HEADER_SIZE: usize = 36;
 pub const ONION_DATA_CUCKOO_MAGIC: u64 = 0xBA7C_0010_0000_0001;
@@ -105,6 +112,10 @@ pub enum PipelineError {
     InvalidOnionPackedSize {
         bytes: u64,
         entry_size: usize,
+    },
+    InvalidOnionIndexEntrySize {
+        entry_size: usize,
+        slot_size: usize,
     },
     InvalidIndexSize {
         bytes: u64,
@@ -170,6 +181,13 @@ impl fmt::Display for PipelineError {
             PipelineError::InvalidOnionPackedSize { bytes, entry_size } => write!(
                 f,
                 "packed Onion file size {bytes} is not divisible by entry size {entry_size}"
+            ),
+            PipelineError::InvalidOnionIndexEntrySize {
+                entry_size,
+                slot_size,
+            } => write!(
+                f,
+                "onion index entry size {entry_size} cannot fit one {slot_size}-byte index slot"
             ),
             PipelineError::InvalidIndexSize { bytes } => {
                 write!(
@@ -300,6 +318,37 @@ pub struct OnionDataCuckooBuildReport {
     pub packed_entries: u64,
     pub bins_per_table: u32,
     pub output_bytes: u64,
+    pub bin_hashes_file_bytes: u64,
+    pub total_placements: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionIndexCuckooOptions {
+    pub master_seed: u64,
+    pub tag_seed: u64,
+    pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub entry_size: usize,
+}
+
+impl Default for OnionIndexCuckooOptions {
+    fn default() -> Self {
+        Self {
+            master_seed: LEGACY_INDEX_MASTER_SEED,
+            tag_seed: LEGACY_INDEX_TAG_SEED,
+            snapshot_anchor: None,
+            entry_size: DEFAULT_ONION_ENTRY_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionIndexCuckooBuildReport {
+    pub index_entries: u64,
+    pub non_whale_entries: u64,
+    pub bins_per_table: u32,
+    pub slots_per_bin: u16,
+    pub raw_bins_file_bytes: u64,
+    pub meta_file_bytes: u64,
     pub bin_hashes_file_bytes: u64,
     pub total_placements: u64,
 }
@@ -538,6 +587,54 @@ pub fn build_onion_data_cuckoo(
         }
         Err(e) => {
             for path in [&cuckoo_tmp, &bin_hashes_tmp] {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+pub fn build_onion_index_cuckoo(
+    index_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &OnionIndexCuckooOptions,
+) -> Result<OnionIndexCuckooBuildReport, PipelineError> {
+    validate_onion_entry_size(options.entry_size)?;
+    onion_index_slots_per_bin(options.entry_size)?;
+
+    let index_path = index_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let bins_path = out_dir.join(ONION_INDEX_BINS_FILENAME);
+    let meta_path = out_dir.join(ONION_INDEX_META_FILENAME);
+    let bin_hashes_path = out_dir.join(ONION_INDEX_BIN_HASHES_FILENAME);
+    for path in [&bins_path, &meta_path, &bin_hashes_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let bins_tmp = temp_path(&bins_path);
+    let meta_tmp = temp_path(&meta_path);
+    let bin_hashes_tmp = temp_path(&bin_hashes_path);
+    for path in [&bins_tmp, &meta_tmp, &bin_hashes_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result =
+        build_onion_index_cuckoo_inner(index_path, options, &bins_tmp, &meta_tmp, &bin_hashes_tmp);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&bins_tmp, &bins_path)?;
+            std::fs::rename(&meta_tmp, &meta_path)?;
+            std::fs::rename(&bin_hashes_tmp, &bin_hashes_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            for path in [&bins_tmp, &meta_tmp, &bin_hashes_tmp] {
                 let _ = std::fs::remove_file(path);
             }
             Err(e)
@@ -1492,7 +1589,7 @@ fn build_onion_data_cuckoo_inner(
     }
 
     let max_group = groups.iter().map(Vec::len).max().unwrap_or(0);
-    let mut bins_per_table = (max_group as f64 / CUCKOO_LOAD_FACTOR).ceil() as usize;
+    let mut bins_per_table = ((max_group as f64 / CUCKOO_LOAD_FACTOR).ceil() as usize).max(1);
     let max_retry_bins = max_retry_bins(bins_per_table);
     let tables = 'retry: loop {
         let mut tables = Vec::with_capacity(CHUNK_K);
@@ -1544,6 +1641,99 @@ fn build_onion_data_cuckoo_inner(
         output_bytes: header_size as u64 + CHUNK_K as u64 * bins_per_table as u64 * 4,
         bin_hashes_file_bytes,
         total_placements: packed_entries * CHUNK_PBC_HASHES as u64,
+    })
+}
+
+fn build_onion_index_cuckoo_inner(
+    index_path: &Path,
+    options: &OnionIndexCuckooOptions,
+    bins_path: &Path,
+    meta_path: &Path,
+    bin_hashes_path: &Path,
+) -> Result<OnionIndexCuckooBuildReport, PipelineError> {
+    let index_data = std::fs::read(index_path)?;
+    if index_data.len() as u64 % ONION_INDEX_RECORD_SIZE as u64 != 0 {
+        return Err(PipelineError::InvalidIndexSize {
+            bytes: index_data.len() as u64,
+        });
+    }
+    let index_entries = index_data.len() / ONION_INDEX_RECORD_SIZE;
+    if index_entries > u32::MAX as usize {
+        return Err(PipelineError::OnionEntryIdOverflow(index_entries as u64));
+    }
+    let slots_per_bin = onion_index_slots_per_bin(options.entry_size)?;
+
+    let mut non_whale_entries = 0u64;
+    let mut groups: Vec<Vec<u32>> = (0..INDEX_K).map(|_| Vec::new()).collect();
+    for i in 0..index_entries {
+        let base = i * ONION_INDEX_RECORD_SIZE;
+        let script_hash = &index_data[base..base + SCRIPT_HASH_SIZE];
+        if index_data[base + ONION_INDEX_RECORD_SIZE - 1] != ONION_WHALE_FLAG {
+            non_whale_entries += 1;
+        }
+        for group in derive_groups_3(script_hash, INDEX_K) {
+            groups[group].push(i as u32);
+        }
+    }
+
+    let max_group = groups.iter().map(Vec::len).max().unwrap_or(0);
+    let mut bins_per_table = compute_bins_per_table(max_group, slots_per_bin).max(1);
+    let max_retry_bins = max_retry_bins(bins_per_table);
+    let tables = 'retry: loop {
+        let mut tables = Vec::with_capacity(INDEX_K);
+        for (group_id, entries) in groups.iter().enumerate() {
+            let mut sorted = entries.clone();
+            sorted.sort_unstable();
+            match build_onion_index_cuckoo_table(
+                group_id,
+                &sorted,
+                &index_data,
+                bins_per_table,
+                slots_per_bin,
+                options.master_seed,
+            ) {
+                Some(table) => tables.push(table),
+                None if bins_per_table < max_retry_bins => {
+                    bins_per_table += 1;
+                    continue 'retry;
+                }
+                None => {
+                    return Err(PipelineError::CuckooInsertFailed {
+                        group_id,
+                        local_index: sorted.len(),
+                    });
+                }
+            }
+        }
+        break tables;
+    };
+
+    write_onion_index_bins_and_hashes(
+        bins_path,
+        bin_hashes_path,
+        &tables,
+        &index_data,
+        bins_per_table,
+        slots_per_bin,
+        options,
+    )?;
+    write_onion_index_meta(meta_path, bins_per_table as u32, slots_per_bin, options)?;
+
+    let raw_bins_file_bytes = INDEX_K as u64 * bins_per_table as u64 * options.entry_size as u64;
+    let meta_file_bytes = ONION_INDEX_META_HEADER_SIZE as u64
+        + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES) as u64;
+    let bin_hashes_file_bytes =
+        8 + INDEX_K as u64 * bins_per_table as u64 * MERKLE_HASH_SIZE as u64;
+
+    Ok(OnionIndexCuckooBuildReport {
+        index_entries: index_entries as u64,
+        non_whale_entries,
+        bins_per_table: bins_per_table as u32,
+        slots_per_bin: slots_per_bin as u16,
+        raw_bins_file_bytes,
+        meta_file_bytes,
+        bin_hashes_file_bytes,
+        total_placements: index_entries as u64 * INDEX_PBC_HASHES as u64,
     })
 }
 
@@ -1622,6 +1812,17 @@ fn validate_onion_entry_size(entry_size: usize) -> Result<(), PipelineError> {
         return Err(PipelineError::InvalidOnionEntrySize(entry_size));
     }
     Ok(())
+}
+
+fn onion_index_slots_per_bin(entry_size: usize) -> Result<usize, PipelineError> {
+    let slots_per_bin = entry_size / ONION_INDEX_SLOT_SIZE;
+    if slots_per_bin == 0 || slots_per_bin > u16::MAX as usize {
+        return Err(PipelineError::InvalidOnionIndexEntrySize {
+            entry_size,
+            slot_size: ONION_INDEX_SLOT_SIZE,
+        });
+    }
+    Ok(slots_per_bin)
 }
 
 fn write_onion_index_entry<W: Write>(
@@ -1762,6 +1963,185 @@ impl<W: Write> OnionPacker<W> {
         self.current_pos = 0;
         Ok(())
     }
+}
+
+fn build_onion_index_cuckoo_table(
+    group_id: usize,
+    entries: &[u32],
+    index_data: &[u8],
+    bins_per_table: usize,
+    slots_per_bin: usize,
+    master_seed: u64,
+) -> Option<Vec<u32>> {
+    let total_slots = bins_per_table * slots_per_bin;
+    let mut table = vec![EMPTY; total_slots];
+    let mut bin_occupancy = vec![0usize; bins_per_table];
+    let key0 = derive_cuckoo_key(master_seed, group_id, 0);
+    let key1 = derive_cuckoo_key(master_seed, group_id, 1);
+
+    for &idx in entries {
+        let script_hash = onion_index_script_hash(index_data, idx);
+        let bin0 = cuckoo_hash(script_hash, key0, bins_per_table);
+        let bin1 = cuckoo_hash(script_hash, key1, bins_per_table);
+        let (first, second) = if bin_occupancy[bin0] <= bin_occupancy[bin1] {
+            (bin0, bin1)
+        } else {
+            (bin1, bin0)
+        };
+
+        if place_onion_index_slot(&mut table, &mut bin_occupancy, slots_per_bin, first, idx)
+            || place_onion_index_slot(&mut table, &mut bin_occupancy, slots_per_bin, second, idx)
+        {
+            continue;
+        }
+
+        let mut current_idx = idx;
+        let mut current_bin = first;
+        let mut success = false;
+        for kick in 0..CUCKOO_MAX_KICKS {
+            let occ = bin_occupancy[current_bin];
+            let evict_slot = kick % occ;
+            let slot_index = current_bin * slots_per_bin + evict_slot;
+            let evicted = table[slot_index];
+            table[slot_index] = current_idx;
+
+            let ev_script_hash = onion_index_script_hash(index_data, evicted);
+            let ev_bin0 = cuckoo_hash(ev_script_hash, key0, bins_per_table);
+            let ev_bin1 = cuckoo_hash(ev_script_hash, key1, bins_per_table);
+            let alt_bin = if ev_bin0 == current_bin {
+                ev_bin1
+            } else {
+                ev_bin0
+            };
+
+            if place_onion_index_slot(
+                &mut table,
+                &mut bin_occupancy,
+                slots_per_bin,
+                alt_bin,
+                evicted,
+            ) {
+                success = true;
+                break;
+            }
+
+            current_idx = evicted;
+            current_bin = alt_bin;
+        }
+
+        if !success {
+            return None;
+        }
+    }
+
+    Some(table)
+}
+
+fn place_onion_index_slot(
+    table: &mut [u32],
+    bin_occupancy: &mut [usize],
+    slots_per_bin: usize,
+    bin: usize,
+    idx: u32,
+) -> bool {
+    let occ = bin_occupancy[bin];
+    if occ >= slots_per_bin {
+        return false;
+    }
+    table[bin * slots_per_bin + occ] = idx;
+    bin_occupancy[bin] += 1;
+    true
+}
+
+fn onion_index_script_hash(index_data: &[u8], idx: u32) -> &[u8] {
+    let base = idx as usize * ONION_INDEX_RECORD_SIZE;
+    &index_data[base..base + SCRIPT_HASH_SIZE]
+}
+
+fn write_onion_index_bins_and_hashes(
+    bins_path: &Path,
+    bin_hashes_path: &Path,
+    tables: &[Vec<u32>],
+    index_data: &[u8],
+    bins_per_table: usize,
+    slots_per_bin: usize,
+    options: &OnionIndexCuckooOptions,
+) -> Result<(), PipelineError> {
+    let mut bins_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(bins_path)?);
+    let mut hashes_writer =
+        BufWriter::with_capacity(1024 * 1024, File::create_new(bin_hashes_path)?);
+    hashes_writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
+    hashes_writer.write_all(&(bins_per_table as u32).to_le_bytes())?;
+
+    let mut bin = vec![0u8; options.entry_size];
+    for table in tables {
+        for bin_index in 0..bins_per_table {
+            serialize_onion_index_bin(
+                &mut bin,
+                table,
+                bin_index,
+                index_data,
+                slots_per_bin,
+                options.tag_seed,
+            );
+            bins_writer.write_all(&bin)?;
+            let hash = sha256(&bin);
+            hashes_writer.write_all(&hash)?;
+        }
+    }
+    bins_writer.flush()?;
+    hashes_writer.flush()?;
+    Ok(())
+}
+
+fn serialize_onion_index_bin(
+    out: &mut [u8],
+    table: &[u32],
+    bin: usize,
+    index_data: &[u8],
+    slots_per_bin: usize,
+    tag_seed: u64,
+) {
+    out.fill(0);
+    let base = bin * slots_per_bin;
+    for slot in 0..slots_per_bin {
+        let idx = table[base + slot];
+        if idx == EMPTY {
+            continue;
+        }
+
+        let record_base = idx as usize * ONION_INDEX_RECORD_SIZE;
+        let script_hash = &index_data[record_base..record_base + SCRIPT_HASH_SIZE];
+        let tag = compute_tag(tag_seed, script_hash);
+        let slot_offset = slot * ONION_INDEX_SLOT_SIZE;
+        out[slot_offset..slot_offset + 8].copy_from_slice(&tag.to_le_bytes());
+        out[slot_offset + 8..slot_offset + ONION_INDEX_SLOT_SIZE].copy_from_slice(
+            &index_data[record_base + SCRIPT_HASH_SIZE..record_base + ONION_INDEX_RECORD_SIZE],
+        );
+    }
+}
+
+fn write_onion_index_meta(
+    path: &Path,
+    bins_per_table: u32,
+    slots_per_bin: usize,
+    options: &OnionIndexCuckooOptions,
+) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::new(File::create_new(path)?);
+    let magic = cuckoo_magic(ONION_INDEX_META_MAGIC, options.snapshot_anchor.is_some());
+    writer.write_all(&magic.to_le_bytes())?;
+    writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
+    writer.write_all(&(ONION_INDEX_CUCKOO_HASHES as u32).to_le_bytes())?;
+    writer.write_all(&(slots_per_bin as u32).to_le_bytes())?;
+    writer.write_all(&bins_per_table.to_le_bytes())?;
+    writer.write_all(&options.master_seed.to_le_bytes())?;
+    writer.write_all(&options.tag_seed.to_le_bytes())?;
+    writer.write_all(&(ONION_INDEX_SLOT_SIZE as u32).to_le_bytes())?;
+    if let Some(anchor) = options.snapshot_anchor {
+        writer.write_all(&anchor)?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 fn build_onion_data_cuckoo_table(
@@ -2419,6 +2799,104 @@ mod tests {
         assert_eq!(
             &anchored_onion_data_cuckoo
                 [ONION_DATA_CUCKOO_HEADER_SIZE..ONION_DATA_CUCKOO_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
+            &regtest_anchor
+        );
+
+        let onion_index_report1 = build_onion_index_cuckoo(
+            out1.join(ONION_INDEX_FILENAME),
+            &out1,
+            &OnionIndexCuckooOptions::default(),
+        )
+        .expect("build onion index cuckoo 1");
+        let onion_index_report2 = build_onion_index_cuckoo(
+            out2.join(ONION_INDEX_FILENAME),
+            &out2,
+            &OnionIndexCuckooOptions::default(),
+        )
+        .expect("build onion index cuckoo 2");
+        let expected_onion_index = OnionIndexCuckooBuildReport {
+            index_entries: 9,
+            non_whale_entries: 9,
+            bins_per_table: 1,
+            slots_per_bin: 221,
+            raw_bins_file_bytes: 249_600,
+            meta_file_bytes: 44,
+            bin_hashes_file_bytes: 2_408,
+            total_placements: 27,
+        };
+        assert_eq!(onion_index_report1, expected_onion_index);
+        assert_eq!(onion_index_report2, expected_onion_index);
+        for file in [
+            ONION_INDEX_BINS_FILENAME,
+            ONION_INDEX_META_FILENAME,
+            ONION_INDEX_BIN_HASHES_FILENAME,
+        ] {
+            assert_eq!(
+                std::fs::read(out1.join(file)).unwrap(),
+                std::fs::read(out2.join(file)).unwrap(),
+                "{file} differs across repeated builds"
+            );
+        }
+        let onion_index_meta = std::fs::read(out1.join(ONION_INDEX_META_FILENAME)).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(onion_index_meta[0..8].try_into().unwrap()),
+            ONION_INDEX_META_MAGIC
+        );
+        assert_eq!(
+            u64::from_le_bytes(onion_index_meta[24..32].try_into().unwrap()),
+            LEGACY_INDEX_MASTER_SEED
+        );
+        assert_eq!(
+            u64::from_le_bytes(onion_index_meta[32..40].try_into().unwrap()),
+            LEGACY_INDEX_TAG_SEED
+        );
+
+        let onion_index_anchor1 = dir.join("onion-index-anchor-1");
+        let onion_index_anchor2 = dir.join("onion-index-anchor-2");
+        let onion_index_anchor_options = OnionIndexCuckooOptions {
+            master_seed: 0xf5c3_6b45_6159_d686,
+            tag_seed: 0x0c65_b3f4_e239_2919,
+            snapshot_anchor: Some(regtest_anchor),
+            ..Default::default()
+        };
+        let onion_index_anchor_report1 = build_onion_index_cuckoo(
+            out1.join(ONION_INDEX_FILENAME),
+            &onion_index_anchor1,
+            &onion_index_anchor_options,
+        )
+        .expect("build anchored onion index cuckoo 1");
+        let onion_index_anchor_report2 = build_onion_index_cuckoo(
+            out1.join(ONION_INDEX_FILENAME),
+            &onion_index_anchor2,
+            &onion_index_anchor_options,
+        )
+        .expect("build anchored onion index cuckoo 2");
+        let expected_onion_index_anchor = OnionIndexCuckooBuildReport {
+            meta_file_bytes: 80,
+            ..expected_onion_index
+        };
+        assert_eq!(onion_index_anchor_report1, expected_onion_index_anchor);
+        assert_eq!(onion_index_anchor_report2, expected_onion_index_anchor);
+        for file in [
+            ONION_INDEX_BINS_FILENAME,
+            ONION_INDEX_META_FILENAME,
+            ONION_INDEX_BIN_HASHES_FILENAME,
+        ] {
+            assert_eq!(
+                std::fs::read(onion_index_anchor1.join(file)).unwrap(),
+                std::fs::read(onion_index_anchor2.join(file)).unwrap(),
+                "{file} differs across repeated anchored builds"
+            );
+        }
+        let anchored_onion_index_meta =
+            std::fs::read(onion_index_anchor1.join(ONION_INDEX_META_FILENAME)).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(anchored_onion_index_meta[0..8].try_into().unwrap()),
+            ONION_INDEX_META_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR
+        );
+        assert_eq!(
+            &anchored_onion_index_meta
+                [ONION_INDEX_META_HEADER_SIZE..ONION_INDEX_META_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
             &regtest_anchor
         );
 

@@ -17,6 +17,7 @@ fn main() -> ExitCode {
             build_onion_pack(&args[2], &args[3], args.get(4))
         }
         Some("build-onion-data-cuckoo") if args.len() >= 4 => build_onion_data_cuckoo(&args),
+        Some("build-onion-index-cuckoo") if args.len() >= 4 => build_onion_index_cuckoo(&args),
         Some("build-index-cuckoo") if args.len() == 4 || args.len() == 6 => {
             match parse_optional_anchor(&args, 4) {
                 Ok(anchor) => build_index_cuckoo(&args[2], &args[3], anchor),
@@ -102,7 +103,7 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
 }
 
@@ -200,34 +201,11 @@ fn build_onion_pack(flat_utxo_set: &str, out_dir: &str, entry_size: Option<&Stri
 fn build_onion_data_cuckoo(args: &[String]) -> ExitCode {
     let packed_file = &args[2];
     let out_dir = &args[3];
-    let mut entry_size = dbpipeline::OnionDataCuckooOptions::default().entry_size;
-    let mut anchor_path: Option<&str> = None;
-
-    let mut i = 4;
-    if let Some(arg) = args.get(i) {
-        if arg != "--anchor" {
-            match arg.parse::<usize>() {
-                Ok(n) if n > 0 && n <= u16::MAX as usize => entry_size = n,
-                _ => {
-                    eprintln!(
-                        "error: entry-size must be an integer in 1..={}: {arg}",
-                        u16::MAX
-                    );
-                    return ExitCode::from(2);
-                }
-            }
-            i += 1;
-        }
-    }
-    if i < args.len() {
-        if args.len() == i + 2 && args[i] == "--anchor" {
-            anchor_path = Some(&args[i + 1]);
-        } else {
-            eprintln!("error: expected optional argument shape: [entry-size] [--anchor <chain_anchor.bin>]");
-            usage(&args[0]);
-            return ExitCode::from(2);
-        }
-    }
+    let (entry_size, anchor_path) =
+        match parse_onion_entry_size_and_anchor(args, dbpipeline::DEFAULT_ONION_ENTRY_SIZE) {
+            Ok(parsed) => parsed,
+            Err(code) => return code,
+        };
 
     let options = match onion_data_cuckoo_options(anchor_path, entry_size) {
         Ok(options) => options,
@@ -252,6 +230,79 @@ fn build_onion_data_cuckoo(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn build_onion_index_cuckoo(args: &[String]) -> ExitCode {
+    let index_file = &args[2];
+    let out_dir = &args[3];
+    let (entry_size, anchor_path) =
+        match parse_onion_entry_size_and_anchor(args, dbpipeline::DEFAULT_ONION_ENTRY_SIZE) {
+            Ok(parsed) => parsed,
+            Err(code) => return code,
+        };
+
+    let options = match onion_index_cuckoo_options(anchor_path, entry_size) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match dbpipeline::build_onion_index_cuckoo(index_file, out_dir, &options) {
+        Ok(report) => {
+            println!("index_entries={}", report.index_entries);
+            println!("non_whale_entries={}", report.non_whale_entries);
+            println!("bins_per_table={}", report.bins_per_table);
+            println!("slots_per_bin={}", report.slots_per_bin);
+            println!("total_placements={}", report.total_placements);
+            println!("raw_bins_file_bytes={}", report.raw_bins_file_bytes);
+            println!("meta_file_bytes={}", report.meta_file_bytes);
+            println!("bin_hashes_file_bytes={}", report.bin_hashes_file_bytes);
+            println!("entry_size={entry_size}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn parse_onion_entry_size_and_anchor<'a>(
+    args: &'a [String],
+    default_entry_size: usize,
+) -> Result<(usize, Option<&'a str>), ExitCode> {
+    let mut entry_size = default_entry_size;
+    let mut anchor_path: Option<&str> = None;
+
+    let mut i = 4;
+    if let Some(arg) = args.get(i) {
+        if arg != "--anchor" {
+            match arg.parse::<usize>() {
+                Ok(n) if n > 0 && n <= u16::MAX as usize => entry_size = n,
+                _ => {
+                    eprintln!(
+                        "error: entry-size must be an integer in 1..={}: {arg}",
+                        u16::MAX
+                    );
+                    return Err(ExitCode::from(2));
+                }
+            }
+            i += 1;
+        }
+    }
+    if i < args.len() {
+        if args.len() == i + 2 && args[i] == "--anchor" {
+            anchor_path = Some(&args[i + 1]);
+        } else {
+            eprintln!("error: expected optional argument shape: [entry-size] [--anchor <chain_anchor.bin>]");
+            usage(&args[0]);
+            return Err(ExitCode::from(2));
+        }
+    }
+
+    Ok((entry_size, anchor_path))
 }
 
 fn build_index_cuckoo(index_file: &str, output_file: &str, anchor_path: Option<&str>) -> ExitCode {
@@ -391,6 +442,36 @@ fn onion_data_cuckoo_options(
             };
             println!("seed_source=legacy");
             println!("onion_data_master_seed=0x{:016x}", options.master_seed);
+            Ok(options)
+        }
+    }
+}
+
+fn onion_index_cuckoo_options(
+    anchor_path: Option<&str>,
+    entry_size: usize,
+) -> Result<dbpipeline::OnionIndexCuckooOptions, String> {
+    match anchor_path {
+        Some(path) => {
+            let (anchor, seeds) = load_snapshot_seeds(path)?;
+            print_anchor_seed_source(&anchor);
+            println!("onion_index_master_seed=0x{:016x}", seeds.index_master);
+            println!("onion_index_tag_seed=0x{:016x}", seeds.index_tag);
+            Ok(dbpipeline::OnionIndexCuckooOptions {
+                master_seed: seeds.index_master,
+                tag_seed: seeds.index_tag,
+                snapshot_anchor: Some(anchor.to_bytes()),
+                entry_size,
+            })
+        }
+        None => {
+            let options = dbpipeline::OnionIndexCuckooOptions {
+                entry_size,
+                ..Default::default()
+            };
+            println!("seed_source=legacy");
+            println!("onion_index_master_seed=0x{:016x}", options.master_seed);
+            println!("onion_index_tag_seed=0x{:016x}", options.tag_seed);
             Ok(options)
         }
     }

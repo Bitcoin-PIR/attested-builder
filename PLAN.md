@@ -79,8 +79,12 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `gen_2_onion` is also split: `onion_packed_entries.bin` →
   `onion_chunk_cuckoo.bin` + `onion_data_bin_hashes.bin`, with
   chain-derived data-cuckoo seeds when `chain_anchor.bin` is supplied.
-  The remaining Onion cuts are the FFI-heavy data NTT store, Onion index
-  cuckoo/PIR, and Onion Merkle stages.
+  The pure Rust half of `gen_3_onion` is split as well:
+  `onion_index.bin` → `onion_index_bins.bin`, `onion_index_meta.bin`,
+  and `onion_index_bin_hashes.bin`. The raw index-bin artifact keeps
+  cuckoo/slot serialization out of the later OnionPIR preprocessing
+  stage. The remaining Onion cuts are the FFI-heavy data NTT store,
+  Onion index preprocessing/consolidation, and Onion Merkle stages.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
