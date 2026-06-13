@@ -6,6 +6,7 @@ license.workspace = true
 description = "Bitcoin Core dumptxoutset v2 parser and MuHash verifier"
 
 [dependencies]
+bitcoin_hashes = "=0.14.1"
 coremuhash = { path = "../coremuhash" }
 hex = "=0.4.3"
 k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic"] }

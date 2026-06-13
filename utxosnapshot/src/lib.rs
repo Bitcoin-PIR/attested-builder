@@ -9,11 +9,12 @@
 //! where `CTxOut` is normal transaction-output serialization:
 //! `amount i64 little-endian || CompactSize(scriptPubKey.len) || scriptPubKey`.
 
+use bitcoin_hashes::{hash160, Hash};
 use coremuhash::MuHash3072;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 pub const SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
@@ -22,6 +23,7 @@ pub const MAINNET_MAGIC: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
 pub const REGTEST_MAGIC: [u8; 4] = [0xfa, 0xbf, 0xb5, 0xda];
 pub const TESTNET3_MAGIC: [u8; 4] = [0x0b, 0x11, 0x09, 0x07];
 pub const SIGNET_MAGIC: [u8; 4] = [0x0a, 0x03, 0xcf, 0x40];
+pub const FLAT_UTXO_ENTRY_SIZE: u64 = 68;
 
 const NUM_SPECIAL_SCRIPTS: u64 = 6;
 const MAX_SCRIPT_SIZE: u64 = 10_000;
@@ -42,6 +44,8 @@ pub enum SnapshotError {
     TrailingBytes,
     BadExpectedMuhash(String),
     MuhashMismatch { expected: String, actual: String },
+    OutputExists(String),
+    MissingOutputParent(String),
 }
 
 impl fmt::Display for SnapshotError {
@@ -69,6 +73,10 @@ impl fmt::Display for SnapshotError {
             SnapshotError::BadExpectedMuhash(s) => write!(f, "bad expected muhash hex: {s}"),
             SnapshotError::MuhashMismatch { expected, actual } => {
                 write!(f, "muhash mismatch: expected {expected}, actual {actual}")
+            }
+            SnapshotError::OutputExists(path) => write!(f, "output already exists: {path}"),
+            SnapshotError::MissingOutputParent(path) => {
+                write!(f, "output path has no parent directory: {path}")
             }
         }
     }
@@ -126,6 +134,14 @@ pub struct MuhashReport {
     pub header: SnapshotHeader,
     pub coins: u64,
     pub muhash_display_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatUtxoReport {
+    pub header: SnapshotHeader,
+    pub coins: u64,
+    pub muhash_display_hex: String,
+    pub flat_utxo_bytes: u64,
 }
 
 pub struct SnapshotReader<R> {
@@ -272,13 +288,7 @@ pub fn verify_muhash(
     path: impl AsRef<Path>,
     expected_display_hex: &str,
 ) -> Result<MuhashReport, SnapshotError> {
-    if expected_display_hex.len() != 64
-        || !expected_display_hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Err(SnapshotError::BadExpectedMuhash(
-            expected_display_hex.to_owned(),
-        ));
-    }
+    validate_expected_muhash(expected_display_hex)?;
     let report = compute_muhash(path)?;
     if !report
         .muhash_display_hex
@@ -292,10 +302,136 @@ pub fn verify_muhash(
     Ok(report)
 }
 
+/// Stream a Core snapshot into the legacy BitcoinPIR 68-byte flat UTXO
+/// format while verifying the full-set MuHash.
+///
+/// Output record layout:
+/// `HASH160(scriptPubKey) || txid || vout_le || amount_sats_le || height_le`.
+/// The destination is created atomically: a temp file in the same directory is
+/// written first, and the final path is installed only after the expected
+/// muhash matches.
+pub fn materialize_flat_utxo_set(
+    snapshot_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    expected_display_hex: &str,
+) -> Result<FlatUtxoReport, SnapshotError> {
+    validate_expected_muhash(expected_display_hex)?;
+
+    let output_path = output_path.as_ref();
+    if output_path.exists() {
+        return Err(SnapshotError::OutputExists(
+            output_path.display().to_string(),
+        ));
+    }
+    let parent = output_path
+        .parent()
+        .ok_or_else(|| SnapshotError::MissingOutputParent(output_path.display().to_string()))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp_path = output_path.with_extension(format!(
+        "{}tmp-{}",
+        output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    if tmp_path.exists() {
+        return Err(SnapshotError::OutputExists(tmp_path.display().to_string()));
+    }
+
+    let result = materialize_flat_utxo_set_inner(snapshot_path, &tmp_path, expected_display_hex);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&tmp_path, output_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+fn materialize_flat_utxo_set_inner(
+    snapshot_path: impl AsRef<Path>,
+    tmp_path: &Path,
+    expected_display_hex: &str,
+) -> Result<FlatUtxoReport, SnapshotError> {
+    let mut snapshot = SnapshotReader::open(snapshot_path)?;
+    let header = snapshot.header().clone();
+    let mut muhash = MuHash3072::new();
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create_new(tmp_path)?);
+    let mut coins = 0u64;
+
+    while let Some(coin) = snapshot.next_coin()? {
+        muhash.insert(&coin.muhash_preimage());
+        write_flat_utxo_entry(&mut writer, &coin)?;
+        coins += 1;
+    }
+    snapshot.finish()?;
+    writer.flush()?;
+
+    let actual = muhash.digest_display_hex();
+    if !actual.eq_ignore_ascii_case(expected_display_hex) {
+        return Err(SnapshotError::MuhashMismatch {
+            expected: expected_display_hex.to_ascii_lowercase(),
+            actual,
+        });
+    }
+
+    Ok(FlatUtxoReport {
+        header,
+        coins,
+        muhash_display_hex: actual,
+        flat_utxo_bytes: coins * FLAT_UTXO_ENTRY_SIZE,
+    })
+}
+
+pub fn write_chain_anchor(
+    path: impl AsRef<Path>,
+    header: &SnapshotHeader,
+    height: u32,
+) -> Result<(), SnapshotError> {
+    let path = path.as_ref();
+    if path.exists() {
+        return Err(SnapshotError::OutputExists(path.display().to_string()));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut writer = BufWriter::new(File::create_new(path)?);
+    writer.write_all(&header.base_hash)?;
+    writer.write_all(&height.to_le_bytes())?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub fn display_hash_hex(internal: &[u8; 32]) -> String {
     let mut h = *internal;
     h.reverse();
     hex::encode(h)
+}
+
+fn validate_expected_muhash(expected_display_hex: &str) -> Result<(), SnapshotError> {
+    if expected_display_hex.len() != 64
+        || !expected_display_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(SnapshotError::BadExpectedMuhash(
+            expected_display_hex.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_flat_utxo_entry<W: Write>(writer: &mut W, coin: &Coin) -> Result<(), SnapshotError> {
+    let script_hash = hash160::Hash::hash(&coin.script_pubkey);
+    writer.write_all(&script_hash[..])?;
+    writer.write_all(&coin.txid)?;
+    writer.write_all(&coin.vout.to_le_bytes())?;
+    writer.write_all(&coin.amount_sats.to_le_bytes())?;
+    writer.write_all(&coin.height.to_le_bytes())?;
+    Ok(())
 }
 
 fn checked_vout(vout: u64) -> Result<u32, SnapshotError> {
@@ -543,6 +679,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn materializes_flat_utxo_set_after_muhash_verify() {
+        let dir = fresh_temp_dir("materialize-ok");
+        let out = dir.join("utxo_set.bin");
+        let anchor = dir.join("chain_anchor.bin");
+
+        let report = materialize_flat_utxo_set(REGTEST_FIXTURE, &out, REGTEST_MUHASH)
+            .expect("materialize flat utxo set");
+        write_chain_anchor(&anchor, &report.header, 111).expect("write chain anchor");
+
+        assert_eq!(report.coins, 115);
+        assert_eq!(report.flat_utxo_bytes, 115 * FLAT_UTXO_ENTRY_SIZE);
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            115 * FLAT_UTXO_ENTRY_SIZE
+        );
+        assert_eq!(std::fs::metadata(&anchor).unwrap().len(), 36);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn materialize_removes_temp_file_on_muhash_mismatch() {
+        let dir = fresh_temp_dir("materialize-mismatch");
+        let out = dir.join("utxo_set.bin");
+        let err = materialize_flat_utxo_set(REGTEST_FIXTURE, &out, &"00".repeat(32))
+            .expect_err("muhash mismatch");
+        assert!(matches!(err, SnapshotError::MuhashMismatch { .. }));
+        assert!(!out.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "temp output should be removed after mismatch"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn compress_amount_for_test(mut n: u64) -> u64 {
         if n == 0 {
             return 0;
@@ -559,5 +731,18 @@ mod tests {
         } else {
             1 + (n - 1) * 10 + 9
         }
+    }
+
+    fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "attested-builder-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
     }
 }
