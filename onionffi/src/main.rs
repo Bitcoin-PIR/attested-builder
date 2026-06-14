@@ -12,6 +12,7 @@ fn main() -> ExitCode {
             preprocess_data_ntt(&args)
         }
         Some("preprocess-index-all") if args.len() == 5 => preprocess_index_all(&args),
+        Some("preprocess-all") if args.len() == 3 || args.len() == 4 => preprocess_all(&args),
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -112,8 +113,50 @@ fn preprocess_index_all(args: &[String]) -> ExitCode {
     }
 }
 
+fn preprocess_all(args: &[String]) -> ExitCode {
+    let push_batch_entries = match args.get(3) {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("error: push_batch_entries must be a positive integer: {s}");
+                return ExitCode::from(2);
+            }
+        },
+        None => onionffi::DEFAULT_PUSH_BATCH_ENTRIES,
+    };
+    let options = onionffi::PreprocessAllOptions {
+        data_ntt: onionffi::DataNttOptions { push_batch_entries },
+    };
+
+    match onionffi::preprocess_all_dir(&args[2], &options) {
+        Ok(report) => {
+            println!("data_ntt_input_entries={}", report.data_ntt.input_entries);
+            println!("data_ntt_output_bytes={}", report.data_ntt.output_bytes);
+            println!("index_all_k={}", report.index_all.k);
+            println!(
+                "index_all_per_group_bytes={}",
+                report.index_all.per_group_bytes
+            );
+            println!("index_all_output_bytes={}", report.index_all.output_bytes);
+            println!(
+                "sibling_index_output_bytes={}",
+                report.sibling_index.output_bytes
+            );
+            println!(
+                "sibling_data_output_bytes={}",
+                report.sibling_data.output_bytes
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n  {bin} preprocess-data-ntt <onion_packed_entries.bin> <out-onion_shared_ntt.bin> [push_batch_entries]\n  {bin} preprocess-index-all <onion_index_bins.bin> <onion_index_meta.bin> <out-onion_index_all.bin>\n\nNon-empty preprocessing commands require rebuilding with `--features ffi`."
+        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n  {bin} preprocess-data-ntt <onion_packed_entries.bin> <out-onion_shared_ntt.bin> [push_batch_entries]\n  {bin} preprocess-index-all <onion_index_bins.bin> <onion_index_meta.bin> <out-onion_index_all.bin>\n  {bin} preprocess-all <pipeline-output-dir> [push_batch_entries]\n\nNon-empty preprocessing commands require rebuilding with `--features ffi`."
     );
 }

@@ -20,6 +20,15 @@ pub const CHAIN_ANCHOR_BYTES: usize = 36;
 pub const DELTA_ANCHOR_BYTES: usize = 72;
 pub const ANCHOR_MAGIC_SNAPSHOT_XOR: u64 = 0x0000_0001_0000_0000;
 pub const ANCHOR_MAGIC_DELTA_XOR: u64 = 0x0000_0002_0000_0000;
+pub const ONION_PACKED_ENTRIES_FILENAME: &str = "onion_packed_entries.bin";
+pub const ONION_SHARED_NTT_FILENAME: &str = "onion_shared_ntt.bin";
+pub const ONION_INDEX_BINS_FILENAME: &str = "onion_index_bins.bin";
+pub const ONION_INDEX_META_FILENAME: &str = "onion_index_meta.bin";
+pub const ONION_INDEX_ALL_FILENAME: &str = "onion_index_all.bin";
+pub const ONION_MERKLE_SIB_ROWS_INDEX_FILENAME: &str = "merkle_onion_sib_rows_index.bin";
+pub const ONION_MERKLE_SIB_ROWS_DATA_FILENAME: &str = "merkle_onion_sib_rows_data.bin";
+pub const ONION_MERKLE_SIB_INDEX_FILENAME: &str = "merkle_onion_sib_index.bin";
+pub const ONION_MERKLE_SIB_DATA_FILENAME: &str = "merkle_onion_sib_data.bin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiblingKind {
@@ -319,6 +328,19 @@ pub struct IndexAllReport {
     pub output_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreprocessAllOptions {
+    pub data_ntt: DataNttOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreprocessAllReport {
+    pub data_ntt: DataNttReport,
+    pub index_all: IndexAllReport,
+    pub sibling_index: SiblingDbReport,
+    pub sibling_data: SiblingDbReport,
+}
+
 pub fn bits_per_coeff(entry_size: usize, poly_degree: usize) -> Option<u32> {
     if poly_degree == 0 {
         return None;
@@ -612,6 +634,49 @@ pub fn preprocess_index_all_file(
     _output: impl AsRef<Path>,
 ) -> Result<IndexAllReport, Error> {
     Err(Error::FfiUnavailable)
+}
+
+pub fn preprocess_all_dir(
+    dir: impl AsRef<Path>,
+    options: &PreprocessAllOptions,
+) -> Result<PreprocessAllReport, Error> {
+    let dir = dir.as_ref();
+    let packed_entries = dir.join(ONION_PACKED_ENTRIES_FILENAME);
+    let shared_ntt = dir.join(ONION_SHARED_NTT_FILENAME);
+    let index_bins = dir.join(ONION_INDEX_BINS_FILENAME);
+    let index_meta = dir.join(ONION_INDEX_META_FILENAME);
+    let index_all = dir.join(ONION_INDEX_ALL_FILENAME);
+    let sib_rows_index = dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME);
+    let sib_rows_data = dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME);
+    let sib_index = dir.join(ONION_MERKLE_SIB_INDEX_FILENAME);
+    let sib_data = dir.join(ONION_MERKLE_SIB_DATA_FILENAME);
+    let outputs = [&shared_ntt, &index_all, &sib_index, &sib_data];
+
+    for output in outputs {
+        if output.exists() {
+            return Err(Error::OutputExists(output.to_path_buf()));
+        }
+    }
+
+    let result = (|| {
+        let data_ntt = preprocess_data_ntt_file(&packed_entries, &shared_ntt, &options.data_ntt)?;
+        let index_all_report = preprocess_index_all_file(&index_bins, &index_meta, &index_all)?;
+        let sibling_index = preprocess_sibling_rows_file(&sib_rows_index, &sib_index)?;
+        let sibling_data = preprocess_sibling_rows_file(&sib_rows_data, &sib_data)?;
+        Ok(PreprocessAllReport {
+            data_ntt,
+            index_all: index_all_report,
+            sibling_index,
+            sibling_data,
+        })
+    })();
+
+    if result.is_err() {
+        for output in outputs {
+            let _ = std::fs::remove_file(output);
+        }
+    }
+    result
 }
 
 pub fn preprocess_sibling_rows(
@@ -1045,6 +1110,17 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "ffi"))]
+    #[test]
+    fn preprocess_all_requires_ffi_by_default() {
+        let dir = temp_test_path("preprocess-all-noffi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let result = preprocess_all_dir(&dir, &PreprocessAllOptions::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, Err(Error::FfiUnavailable)));
+    }
+
     #[test]
     fn parse_onion_index_meta_legacy_header() {
         let mut data = Vec::new();
@@ -1138,6 +1214,76 @@ mod tests {
         assert_eq!(read_u64_le(&bytes, 8), 2);
         assert_eq!(read_u64_le(&bytes, 16), report.per_group_bytes);
         assert_eq!(read_u64_le(&bytes, 24), 0);
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn preprocess_all_writes_expected_outputs() {
+        let dir = temp_test_path("preprocess-all");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        let payload: Vec<u8> = (0..=255).cycle().take(3328).collect();
+        std::fs::write(dir.join(ONION_PACKED_ENTRIES_FILENAME), &payload).unwrap();
+
+        let mut raw_bins = vec![0u8; 2 * 3328];
+        raw_bins[0] = 7;
+        raw_bins[3328] = 9;
+        std::fs::write(dir.join(ONION_INDEX_BINS_FILENAME), raw_bins).unwrap();
+
+        let mut index_meta = Vec::new();
+        index_meta.extend_from_slice(&ONION_INDEX_META_MAGIC.to_le_bytes());
+        index_meta.extend_from_slice(&2u32.to_le_bytes());
+        index_meta.extend_from_slice(&2u32.to_le_bytes());
+        index_meta.extend_from_slice(&221u32.to_le_bytes());
+        index_meta.extend_from_slice(&1u32.to_le_bytes());
+        index_meta.extend_from_slice(&0x71a2ef38b4c90d15u64.to_le_bytes());
+        index_meta.extend_from_slice(&0xd4e5f6a7b8c91023u64.to_le_bytes());
+        index_meta.extend_from_slice(&15u32.to_le_bytes());
+        std::fs::write(dir.join(ONION_INDEX_META_FILENAME), index_meta).unwrap();
+
+        let mut sib_index = Vec::new();
+        sib_index.extend_from_slice(&SIBLING_ROWS_INDEX_MAGIC.to_le_bytes());
+        sib_index.extend_from_slice(&2u32.to_le_bytes());
+        sib_index.extend_from_slice(&104u32.to_le_bytes());
+        sib_index.extend_from_slice(&0u32.to_le_bytes());
+        sib_index.extend_from_slice(&3328u32.to_le_bytes());
+        std::fs::write(dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME), sib_index).unwrap();
+
+        let mut sib_data = Vec::new();
+        sib_data.extend_from_slice(&SIBLING_ROWS_DATA_MAGIC.to_le_bytes());
+        sib_data.extend_from_slice(&2u32.to_le_bytes());
+        sib_data.extend_from_slice(&104u32.to_le_bytes());
+        sib_data.extend_from_slice(&1u32.to_le_bytes());
+        sib_data.extend_from_slice(&3328u32.to_le_bytes());
+        sib_data.extend_from_slice(&vec![0x11; 3328]);
+        sib_data.extend_from_slice(&vec![0x22; 3328]);
+        std::fs::write(dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME), sib_data).unwrap();
+
+        let report = preprocess_all_dir(
+            &dir,
+            &PreprocessAllOptions {
+                data_ntt: DataNttOptions {
+                    push_batch_entries: 1,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.data_ntt.input_entries, 1);
+        assert_eq!(report.index_all.k, 2);
+        assert_eq!(report.sibling_index.output_bytes, 24);
+        assert_eq!(report.sibling_data.k, 2);
+        for output in [
+            ONION_SHARED_NTT_FILENAME,
+            ONION_INDEX_ALL_FILENAME,
+            ONION_MERKLE_SIB_INDEX_FILENAME,
+            ONION_MERKLE_SIB_DATA_FILENAME,
+        ] {
+            assert!(dir.join(output).exists(), "{output} missing");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_test_path(name: &str) -> std::path::PathBuf {
