@@ -12,6 +12,14 @@ pub const SIBLING_DB_DATA_MAGIC: u64 = 0xBA7C_0E51_0000_0001;
 pub const SIBLING_ROWS_HEADER_SIZE: usize = 24;
 pub const ONION_SAVE_DB_HEADER_SIZE: usize = 48;
 pub const DEFAULT_PUSH_BATCH_ENTRIES: usize = 256;
+pub const ONION_INDEX_META_MAGIC: u64 = 0xBA7C_0010_0000_0002;
+pub const ONION_INDEX_ALL_MAGIC: u64 = 0xBA7C_0010_0000_0003;
+pub const ONION_INDEX_META_HEADER_SIZE: usize = 44;
+pub const ONION_INDEX_ALL_HEADER_SIZE: usize = 32;
+pub const CHAIN_ANCHOR_BYTES: usize = 36;
+pub const DELTA_ANCHOR_BYTES: usize = 72;
+pub const ANCHOR_MAGIC_SNAPSHOT_XOR: u64 = 0x0000_0001_0000_0000;
+pub const ANCHOR_MAGIC_DELTA_XOR: u64 = 0x0000_0002_0000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiblingKind {
@@ -123,13 +131,10 @@ impl fmt::Display for Error {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::OutputExists(path) => write!(f, "output already exists: {}", path.display()),
-            Self::UnknownMagic(magic) => write!(f, "unknown sibling rows magic: 0x{magic:016x}"),
-            Self::TooShort { len } => write!(f, "sibling rows file too short: {len} bytes"),
+            Self::UnknownMagic(magic) => write!(f, "unknown file magic: 0x{magic:016x}"),
+            Self::TooShort { len } => write!(f, "file too short: {len} bytes"),
             Self::SizeMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "sibling rows size mismatch: expected {expected}, got {actual}"
-                )
+                write!(f, "file size mismatch: expected {expected}, got {actual}")
             }
             Self::InvalidBatchSize(size) => {
                 write!(f, "push batch size must be non-zero, got {size}")
@@ -261,6 +266,56 @@ pub struct DataNttReport {
     pub poly_degree: u32,
     pub num_plaintexts: u64,
     pub coeff_val_cnt: u64,
+    pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorTrailer<'a> {
+    None,
+    Snapshot(&'a [u8]),
+    Delta(&'a [u8]),
+}
+
+#[cfg(feature = "ffi")]
+impl<'a> AnchorTrailer<'a> {
+    fn magic_xor(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Snapshot(_) => ANCHOR_MAGIC_SNAPSHOT_XOR,
+            Self::Delta(_) => ANCHOR_MAGIC_DELTA_XOR,
+        }
+    }
+
+    fn borrowed_bytes(self) -> &'a [u8] {
+        match self {
+            Self::None => &[],
+            Self::Snapshot(bytes) | Self::Delta(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnionIndexMeta<'a> {
+    pub k: u32,
+    pub cuckoo_hashes: u32,
+    pub slots_per_bin: u32,
+    pub bins_per_table: u32,
+    pub master_seed: u64,
+    pub tag_seed: u64,
+    pub slot_size: u32,
+    pub anchor: AnchorTrailer<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexAllReport {
+    pub k: u32,
+    pub bins_per_table: u32,
+    pub entry_size: u32,
+    pub poly_degree: u32,
+    pub num_entries: u64,
+    pub num_plaintexts: u64,
+    pub per_group_bytes: u64,
+    pub anchor_bytes: u32,
     pub output_bytes: u64,
 }
 
@@ -441,6 +496,124 @@ pub fn preprocess_data_ntt_file(
     Err(Error::FfiUnavailable)
 }
 
+pub fn parse_onion_index_meta(data: &[u8]) -> Result<OnionIndexMeta<'_>, Error> {
+    if data.len() < ONION_INDEX_META_HEADER_SIZE {
+        return Err(Error::TooShort { len: data.len() });
+    }
+
+    let magic = read_u64_le(data, 0);
+    let anchor_len = match magic {
+        ONION_INDEX_META_MAGIC => 0,
+        m if m == (ONION_INDEX_META_MAGIC ^ ANCHOR_MAGIC_SNAPSHOT_XOR) => CHAIN_ANCHOR_BYTES,
+        m if m == (ONION_INDEX_META_MAGIC ^ ANCHOR_MAGIC_DELTA_XOR) => DELTA_ANCHOR_BYTES,
+        other => return Err(Error::UnknownMagic(other)),
+    };
+    let expected = ONION_INDEX_META_HEADER_SIZE
+        .checked_add(anchor_len)
+        .ok_or(Error::IntegerOverflow("onion index meta length"))?;
+    if data.len() != expected {
+        return Err(Error::SizeMismatch {
+            expected,
+            actual: data.len(),
+        });
+    }
+    let anchor_bytes = &data[ONION_INDEX_META_HEADER_SIZE..expected];
+    let anchor = match anchor_len {
+        0 => AnchorTrailer::None,
+        CHAIN_ANCHOR_BYTES => AnchorTrailer::Snapshot(anchor_bytes),
+        DELTA_ANCHOR_BYTES => AnchorTrailer::Delta(anchor_bytes),
+        _ => unreachable!(),
+    };
+
+    Ok(OnionIndexMeta {
+        k: read_u32_le(data, 8),
+        cuckoo_hashes: read_u32_le(data, 12),
+        slots_per_bin: read_u32_le(data, 16),
+        bins_per_table: read_u32_le(data, 20),
+        master_seed: read_u64_le(data, 24),
+        tag_seed: read_u64_le(data, 32),
+        slot_size: read_u32_le(data, 40),
+        anchor,
+    })
+}
+
+#[cfg(feature = "ffi")]
+pub fn preprocess_index_all_file(
+    bins: impl AsRef<Path>,
+    meta: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+) -> Result<IndexAllReport, Error> {
+    let bins = bins.as_ref();
+    let output = output.as_ref();
+    if output.exists() {
+        return Err(Error::OutputExists(output.to_path_buf()));
+    }
+    let meta_bytes = std::fs::read(meta)?;
+    let meta = parse_onion_index_meta(&meta_bytes)?;
+    if meta.k == 0 {
+        return Err(Error::InvalidOnionShape(
+            "index meta K must be non-zero".to_string(),
+        ));
+    }
+    if meta.bins_per_table == 0 {
+        return Err(Error::InvalidOnionShape(
+            "index meta bins_per_table must be non-zero".to_string(),
+        ));
+    }
+
+    let p = onionpir::params_info(meta.bins_per_table as u64);
+    let entry_size = p.entry_size as usize;
+    let group_bytes = (meta.bins_per_table as usize)
+        .checked_mul(entry_size)
+        .ok_or(Error::IntegerOverflow("index raw group byte length"))?;
+    let expected_bins_bytes = (meta.k as usize)
+        .checked_mul(group_bytes)
+        .ok_or(Error::IntegerOverflow("index raw bins byte length"))?;
+    let actual_bins_bytes = std::fs::metadata(bins)?.len() as usize;
+    if actual_bins_bytes != expected_bins_bytes {
+        return Err(Error::SizeMismatch {
+            expected: expected_bins_bytes,
+            actual: actual_bins_bytes,
+        });
+    }
+    if (meta.slots_per_bin as usize)
+        .checked_mul(meta.slot_size as usize)
+        .ok_or(Error::IntegerOverflow("index slot payload byte length"))?
+        > entry_size
+    {
+        return Err(Error::InvalidOnionShape(format!(
+            "slots_per_bin * slot_size exceeds OnionPIR entry size: {} * {} > {}",
+            meta.slots_per_bin, meta.slot_size, entry_size
+        )));
+    }
+
+    let output_tmp = temp_save_path_near(output)?;
+    let result = write_index_all_temp(bins, &meta, &p, entry_size, &output_tmp);
+    match result {
+        Ok(report) => {
+            if output.exists() {
+                let _ = std::fs::remove_file(&output_tmp);
+                return Err(Error::OutputExists(output.to_path_buf()));
+            }
+            std::fs::rename(&output_tmp, output)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&output_tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(not(feature = "ffi"))]
+pub fn preprocess_index_all_file(
+    _bins: impl AsRef<Path>,
+    _meta: impl AsRef<Path>,
+    _output: impl AsRef<Path>,
+) -> Result<IndexAllReport, Error> {
+    Err(Error::FfiUnavailable)
+}
+
 pub fn preprocess_sibling_rows(
     parsed: ParsedSiblingRows<'_>,
     output: impl AsRef<Path>,
@@ -555,6 +728,153 @@ fn temp_save_path_near(output: &Path) -> Result<PathBuf, Error> {
         .map_err(|_| Error::InvalidOnionShape("system clock is before unix epoch".to_string()))?
         .as_nanos();
     Ok(dir.join(format!(".{name}.{pid}.{nanos}.savetmp")))
+}
+
+#[cfg(feature = "ffi")]
+fn write_index_all_temp(
+    bins: &Path,
+    meta: &OnionIndexMeta<'_>,
+    params: &onionpir::ParamsInfo,
+    entry_size: usize,
+    output_tmp: &Path,
+) -> Result<IndexAllReport, Error> {
+    let mut bins_file = File::open(bins)?;
+    let first =
+        preprocess_index_group_to_temp(&mut bins_file, output_tmp, 0, meta, params, entry_size)?;
+    let per_group_bytes = std::fs::metadata(&first)?.len();
+    let anchor_bytes = meta.anchor.borrowed_bytes();
+    let output_bytes = ONION_INDEX_ALL_HEADER_SIZE as u64
+        + meta.k as u64 * per_group_bytes
+        + anchor_bytes.len() as u64;
+
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create_new(output_tmp)?);
+    writer.write_all(&(ONION_INDEX_ALL_MAGIC ^ meta.anchor.magic_xor()).to_le_bytes())?;
+    writer.write_all(&(meta.k as u64).to_le_bytes())?;
+    writer.write_all(&per_group_bytes.to_le_bytes())?;
+    writer.write_all(&0u64.to_le_bytes())?;
+    copy_blob_and_remove(&first, &mut writer)?;
+
+    for group in 1..meta.k as usize {
+        let temp = preprocess_index_group_to_temp(
+            &mut bins_file,
+            output_tmp,
+            group,
+            meta,
+            params,
+            entry_size,
+        )?;
+        let bytes = std::fs::metadata(&temp)?.len();
+        if bytes != per_group_bytes {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::InvalidOnionShape(format!(
+                "index group {} blob length drifted: expected {}, got {}",
+                group, per_group_bytes, bytes
+            )));
+        }
+        copy_blob_and_remove(&temp, &mut writer)?;
+    }
+    writer.write_all(anchor_bytes)?;
+    writer.flush()?;
+    drop(writer);
+
+    let actual = std::fs::metadata(output_tmp)?.len();
+    if actual != output_bytes {
+        return Err(Error::InvalidOnionShape(format!(
+            "onion_index_all size mismatch: expected {}, got {}",
+            output_bytes, actual
+        )));
+    }
+
+    Ok(IndexAllReport {
+        k: meta.k,
+        bins_per_table: meta.bins_per_table,
+        entry_size: entry_size as u32,
+        poly_degree: params.poly_degree as u32,
+        num_entries: params.num_entries,
+        num_plaintexts: params.num_plaintexts,
+        per_group_bytes,
+        anchor_bytes: anchor_bytes.len() as u32,
+        output_bytes,
+    })
+}
+
+#[cfg(feature = "ffi")]
+fn preprocess_index_group_to_temp(
+    bins_file: &mut File,
+    output: &Path,
+    group: usize,
+    meta: &OnionIndexMeta<'_>,
+    params: &onionpir::ParamsInfo,
+    entry_size: usize,
+) -> Result<PathBuf, Error> {
+    let bins_per_table = meta.bins_per_table as usize;
+    let group_bytes_len = bins_per_table
+        .checked_mul(entry_size)
+        .ok_or(Error::IntegerOverflow("index group byte length"))?;
+    let offset = (group as u64)
+        .checked_mul(group_bytes_len as u64)
+        .ok_or(Error::IntegerOverflow("index group file offset"))?;
+    bins_file.seek(SeekFrom::Start(offset))?;
+    let mut group_bytes = vec![0u8; group_bytes_len];
+    bins_file.read_exact(&mut group_bytes)?;
+
+    let fst_dim = params.fst_dim_sz as usize;
+    let other_dim = params.other_dim_sz as usize;
+    if fst_dim == 0 || other_dim == 0 {
+        return Err(Error::InvalidOnionShape(format!(
+            "invalid OnionPIR dimensions: fst_dim={}, other_dim={}",
+            fst_dim, other_dim
+        )));
+    }
+    let poly_degree = params.poly_degree as usize;
+    let zero = vec![0u8; entry_size];
+    let mut server = onionpir::Server::new(meta.bins_per_table as u64);
+    for chunk_idx in 0..other_dim {
+        let mut batch_coeffs = Vec::with_capacity(fst_dim * poly_degree);
+        for i in 0..fst_dim {
+            let global_bin = chunk_idx * fst_dim + i;
+            let row = if global_bin < bins_per_table {
+                let start = global_bin * entry_size;
+                &group_bytes[start..start + entry_size]
+            } else {
+                &zero
+            };
+            let coeffs = pack_bytes_into_coefficients(row, entry_size, poly_degree);
+            batch_coeffs.extend_from_slice(&coeffs);
+        }
+        if !server.push_plaintexts(
+            &batch_coeffs,
+            fst_dim as u64,
+            (chunk_idx * fst_dim) as u64,
+            &[],
+        ) {
+            return Err(Error::FfiFailed("push_plaintexts"));
+        }
+    }
+
+    let temp = temp_save_path_near(output)?;
+    let temp_str = temp.to_string_lossy();
+    if !server.save_db(&temp_str) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::FfiFailed("save_db"));
+    }
+    let bytes = std::fs::metadata(&temp)?.len();
+    if bytes < ONION_SAVE_DB_HEADER_SIZE as u64 {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::InvalidOnionShape(format!(
+            "index group save_db blob too short: {} bytes",
+            bytes
+        )));
+    }
+    Ok(temp)
+}
+
+#[cfg(feature = "ffi")]
+fn copy_blob_and_remove<W: Write>(path: &Path, writer: &mut W) -> Result<u64, Error> {
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, File::open(path)?);
+    let copied = std::io::copy(&mut reader, writer)?;
+    let _ = std::fs::remove_file(path);
+    Ok(copied)
 }
 
 fn write_consolidated_sibling_db(
@@ -712,6 +1032,40 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "ffi"))]
+    #[test]
+    fn preprocess_index_all_requires_ffi_by_default() {
+        assert!(matches!(
+            preprocess_index_all_file(
+                "missing-onion-index-bins.bin",
+                "missing-onion-index-meta.bin",
+                "missing-onion-index-all.bin"
+            ),
+            Err(Error::FfiUnavailable)
+        ));
+    }
+
+    #[test]
+    fn parse_onion_index_meta_legacy_header() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&ONION_INDEX_META_MAGIC.to_le_bytes());
+        data.extend_from_slice(&75u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&221u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0x71a2ef38b4c90d15u64.to_le_bytes());
+        data.extend_from_slice(&0xd4e5f6a7b8c91023u64.to_le_bytes());
+        data.extend_from_slice(&15u32.to_le_bytes());
+
+        let meta = parse_onion_index_meta(&data).unwrap();
+        assert_eq!(meta.k, 75);
+        assert_eq!(meta.cuckoo_hashes, 2);
+        assert_eq!(meta.slots_per_bin, 221);
+        assert_eq!(meta.bins_per_table, 1);
+        assert_eq!(meta.slot_size, 15);
+        assert!(matches!(meta.anchor, AnchorTrailer::None));
+    }
+
     #[cfg(feature = "ffi")]
     #[test]
     fn preprocess_data_ntt_writes_header_stripped_payload() {
@@ -741,6 +1095,49 @@ mod tests {
             report.output_bytes,
             report.coeff_val_cnt * report.num_plaintexts * 8
         );
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn preprocess_index_all_writes_consolidated_group_blobs() {
+        let bins = temp_test_path("index-bins");
+        let meta_path = temp_test_path("index-meta");
+        let output = temp_test_path("index-all");
+        let _ = std::fs::remove_file(&bins);
+        let _ = std::fs::remove_file(&meta_path);
+        let _ = std::fs::remove_file(&output);
+
+        let mut raw_bins = vec![0u8; 2 * 3328];
+        raw_bins[0] = 7;
+        raw_bins[3328] = 9;
+        std::fs::write(&bins, raw_bins).unwrap();
+
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&ONION_INDEX_META_MAGIC.to_le_bytes());
+        meta.extend_from_slice(&2u32.to_le_bytes());
+        meta.extend_from_slice(&2u32.to_le_bytes());
+        meta.extend_from_slice(&221u32.to_le_bytes());
+        meta.extend_from_slice(&1u32.to_le_bytes());
+        meta.extend_from_slice(&0x71a2ef38b4c90d15u64.to_le_bytes());
+        meta.extend_from_slice(&0xd4e5f6a7b8c91023u64.to_le_bytes());
+        meta.extend_from_slice(&15u32.to_le_bytes());
+        std::fs::write(&meta_path, meta).unwrap();
+
+        let report = preprocess_index_all_file(&bins, &meta_path, &output).unwrap();
+        let bytes = std::fs::read(&output).unwrap();
+        let _ = std::fs::remove_file(&bins);
+        let _ = std::fs::remove_file(&meta_path);
+        let _ = std::fs::remove_file(&output);
+
+        assert_eq!(report.k, 2);
+        assert_eq!(report.bins_per_table, 1);
+        assert_eq!(report.entry_size, 3328);
+        assert_eq!(report.anchor_bytes, 0);
+        assert_eq!(bytes.len() as u64, report.output_bytes);
+        assert_eq!(read_u64_le(&bytes, 0), ONION_INDEX_ALL_MAGIC);
+        assert_eq!(read_u64_le(&bytes, 8), 2);
+        assert_eq!(read_u64_le(&bytes, 16), report.per_group_bytes);
+        assert_eq!(read_u64_le(&bytes, 24), 0);
     }
 
     fn temp_test_path(name: &str) -> std::path::PathBuf {

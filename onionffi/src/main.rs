@@ -11,6 +11,7 @@ fn main() -> ExitCode {
         Some("preprocess-data-ntt") if args.len() == 4 || args.len() == 5 => {
             preprocess_data_ntt(&args)
         }
+        Some("preprocess-index-all") if args.len() == 5 => preprocess_index_all(&args),
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -90,8 +91,29 @@ fn preprocess_data_ntt(args: &[String]) -> ExitCode {
     }
 }
 
+fn preprocess_index_all(args: &[String]) -> ExitCode {
+    match onionffi::preprocess_index_all_file(&args[2], &args[3], &args[4]) {
+        Ok(report) => {
+            println!("k={}", report.k);
+            println!("bins_per_table={}", report.bins_per_table);
+            println!("entry_size={}", report.entry_size);
+            println!("poly_degree={}", report.poly_degree);
+            println!("num_entries={}", report.num_entries);
+            println!("num_plaintexts={}", report.num_plaintexts);
+            println!("per_group_bytes={}", report.per_group_bytes);
+            println!("anchor_bytes={}", report.anchor_bytes);
+            println!("output_bytes={}", report.output_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n  {bin} preprocess-data-ntt <onion_packed_entries.bin> <out-onion_shared_ntt.bin> [push_batch_entries]\n\nNon-empty preprocessing commands require rebuilding with `--features ffi`."
+        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n  {bin} preprocess-data-ntt <onion_packed_entries.bin> <out-onion_shared_ntt.bin> [push_batch_entries]\n  {bin} preprocess-index-all <onion_index_bins.bin> <onion_index_meta.bin> <out-onion_index_all.bin>\n\nNon-empty preprocessing commands require rebuilding with `--features ffi`."
     );
 }
