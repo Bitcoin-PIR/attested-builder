@@ -100,6 +100,10 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `chain_anchor.bin`, Core display muhash, layout bin counts, Onion entry
   size, and `issued_at`, it records the DPF/Harmony and Onion super
   roots plus SHA256 commitments for all known pipeline output files.
+  `generate-builder-key` + `sign-root-bundle` provide the plain-host
+  Ed25519 signing path over that exact payload; the signer module keeps
+  this as a narrow provider boundary so an SEV/TDX/Nitro resident key can
+  later replace the local key file without changing the bundle format.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
@@ -170,28 +174,29 @@ signatures from your existing build hosts already kill the
 "forged-but-self-consistent database" attack for clients who pin your
 keys. Everything after this only upgrades *who* signs.
 
-## Phase 3 — Nitro enclave builder
+## Phase 3 — TEE builder (SEV-SNP / TDX / Nitro)
 
-1. **Architecture**: parent EC2 instance fetches the snapshot
-   (untrusted), streams it over vsock; enclave verifies muhash, builds,
-   streams tables back out (untrusted — clients verify them against the
-   signed roots anyway), and emits the signed bundle. The ONLY
-   trust-bearing outputs are the bundle and the once-per-generation
-   attestation document.
-2. **Key handling**: Ed25519 builder key generated inside the enclave
-   at first boot; pubkey bound into the attestation document
-   (`public_key` field) via the NSM API (`aws-nitro-enclaves-nsm-api`
-   crate). Decide persistence: ephemeral per-build keys (rotate the pin
-   with every enclave generation, simplest) vs. sealed via KMS
-   (operational complexity; defer).
-3. **Reproducible EIF**: build the enclave image from the nix
-   derivation (`dockerTools` → `nitro-cli build-enclave`), same
-   discipline as `nix build .#unified-server` / the Tier-3 UKI. Publish
-   PCR0/1/2 next to the existing pins; auditors check the attestation
-   doc chains to AWS's root cert and matches the PCRs.
-4. **Memory**: enclave RAM is hugepage-carved from the parent. Start
-   with an r7i.8xlarge-class parent (256 GB) and the ≤64 GB pipeline
-   budget from Phase 1; tighten later if cost matters.
+1. **Architecture**: untrusted host fetches the snapshot and streams it
+   into the confidential guest (vsock or the platform's equivalent);
+   the guest verifies muhash, builds, streams tables back out
+   (untrusted — clients verify them against the signed roots anyway),
+   and emits the signed bundle. The ONLY trust-bearing outputs are the
+   bundle and the once-per-generation attestation evidence.
+2. **Key handling**: Ed25519 builder key generated inside the TEE at
+   first boot; pubkey bound into the platform quote/report user data.
+   For SEV-SNP/TDX this means report-data binding; for Nitro it is the
+   attestation document `public_key`/user-data path. Decide persistence:
+   ephemeral per-build keys (rotate the pin with every guest
+   generation, simplest) vs. platform sealing/KMS (operational
+   complexity; defer).
+3. **Reproducible guest image**: build the measured guest image from the
+   nix derivation, same discipline as `nix build .#unified-server` / the
+   Tier-3 UKI. Publish the platform measurement next to the existing
+   pins; auditors check the attestation evidence chains to the platform
+   root and binds the expected builder pubkey.
+4. **Memory**: choose a SEV-SNP/TDX/Nitro host class with enough
+   encrypted guest RAM for the ≤64 GB pipeline budget from Phase 1;
+   tighten later if cost matters.
 
 ## Phase 4 — builder diversity
 

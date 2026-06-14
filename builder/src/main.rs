@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 mod root_payload;
+mod signer;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -43,6 +44,10 @@ fn main() -> ExitCode {
                 &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
                 &args[10],
             )
+        }
+        Some("generate-builder-key") if args.len() == 3 => signer::generate_builder_key(&args[2]),
+        Some("sign-root-bundle") if args.len() == 5 => {
+            signer::sign_root_bundle(&args[2], &args[3], &args[4])
         }
         _ => {
             usage(&args[0]);
@@ -114,7 +119,7 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-merkle <onion_index_bin_hashes.bin> <onion_data_bin_hashes.bin> <out-dir> [entry-size]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-merkle <onion_index_bin_hashes.bin> <onion_data_bin_hashes.bin> <out-dir> [entry-size]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n  {bin} generate-builder-key <out-builder-key.txt>\n  {bin} sign-root-bundle <payload.bin> <builder-key.txt> <out-signed-root-bundle.bin>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
 }
 

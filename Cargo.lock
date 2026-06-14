@@ -319,6 +319,8 @@ name = "pir-attested-builder"
 version = "0.1.0"
 dependencies = [
  "dbpipeline",
+ "ed25519-dalek",
+ "getrandom",
  "hex",
  "rootbundle",
  "sha2",
