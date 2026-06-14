@@ -83,8 +83,11 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `onion_index.bin` → `onion_index_bins.bin`, `onion_index_meta.bin`,
   and `onion_index_bin_hashes.bin`. The raw index-bin artifact keeps
   cuckoo/slot serialization out of the later OnionPIR preprocessing
-  stage. The remaining Onion cuts are the FFI-heavy data NTT store,
-  Onion index preprocessing/consolidation, and Onion Merkle stages.
+  stage. The pure root/top half of `gen_4_build_merkle_onion` is split:
+  `onion_index_bin_hashes.bin` + `onion_data_bin_hashes.bin` →
+  `merkle_onion_{tree_tops,roots,root}.bin`. The remaining Onion cuts
+  are the FFI-heavy data NTT store, Onion index
+  preprocessing/consolidation, and Onion Merkle sibling DBs.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

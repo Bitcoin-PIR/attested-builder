@@ -18,6 +18,9 @@ fn main() -> ExitCode {
         }
         Some("build-onion-data-cuckoo") if args.len() >= 4 => build_onion_data_cuckoo(&args),
         Some("build-onion-index-cuckoo") if args.len() >= 4 => build_onion_index_cuckoo(&args),
+        Some("build-onion-merkle") if args.len() == 5 || args.len() == 6 => {
+            build_onion_merkle(&args[2], &args[3], &args[4], args.get(5))
+        }
         Some("build-index-cuckoo") if args.len() == 4 || args.len() == 6 => {
             match parse_optional_anchor(&args, 4) {
                 Ok(anchor) => build_index_cuckoo(&args[2], &args[3], anchor),
@@ -103,7 +106,7 @@ fn materialize_utxo_set(
 
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
+        "usage:\n  {bin} verify-snapshot <txoutset.dat> <expected-muhash-display-hex>\n  {bin} materialize-utxo-set <txoutset.dat> <expected-muhash-display-hex> <out-utxo_set.bin> <anchor-height> <out-chain_anchor.bin>\n  {bin} build-utxo-chunks <utxo_set.bin> <out-dir> [partitions]\n  {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n  {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n  {bin} build-onion-merkle <onion_index_bin_hashes.bin> <onion_data_bin_hashes.bin> <out-dir> [entry-size]\n  {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n  {bin} params-hash <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size>"
     );
 }
 
@@ -259,6 +262,47 @@ fn build_onion_index_cuckoo(args: &[String]) -> ExitCode {
             println!("raw_bins_file_bytes={}", report.raw_bins_file_bytes);
             println!("meta_file_bytes={}", report.meta_file_bytes);
             println!("bin_hashes_file_bytes={}", report.bin_hashes_file_bytes);
+            println!("entry_size={entry_size}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn build_onion_merkle(
+    index_bin_hashes: &str,
+    data_bin_hashes: &str,
+    out_dir: &str,
+    entry_size: Option<&String>,
+) -> ExitCode {
+    let entry_size = match entry_size {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 && n <= u16::MAX as usize => n,
+            _ => {
+                eprintln!(
+                    "error: entry-size must be an integer in 1..={}: {s}",
+                    u16::MAX
+                );
+                return ExitCode::from(2);
+            }
+        },
+        None => dbpipeline::OnionMerkleOptions::default().entry_size,
+    };
+    let options = dbpipeline::OnionMerkleOptions { entry_size };
+    match dbpipeline::build_onion_merkle(index_bin_hashes, data_bin_hashes, out_dir, &options) {
+        Ok(report) => {
+            println!("index_k={}", report.index_k);
+            println!("data_k={}", report.data_k);
+            println!("index_bins_per_table={}", report.index_bins_per_table);
+            println!("data_bins_per_table={}", report.data_bins_per_table);
+            println!("arity={}", report.arity);
+            println!("tree_count={}", report.tree_count);
+            println!("tree_tops_file_bytes={}", report.tree_tops_file_bytes);
+            println!("roots_file_bytes={}", report.roots_file_bytes);
+            println!("super_root={}", hex::encode(report.super_root));
             println!("entry_size={entry_size}");
             ExitCode::SUCCESS
         }

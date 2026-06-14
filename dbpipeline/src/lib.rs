@@ -78,6 +78,10 @@ pub const ONION_INDEX_META_MAGIC: u64 = 0xBA7C_0010_0000_0002;
 pub const ONION_DATA_CUCKOO_HASHES: usize = 6;
 pub const ONION_DATA_CUCKOO_HEADER_SIZE: usize = 36;
 pub const ONION_DATA_CUCKOO_MAGIC: u64 = 0xBA7C_0010_0000_0001;
+pub const ONION_MERKLE_TREE_TOPS_FILENAME: &str = "merkle_onion_tree_tops.bin";
+pub const ONION_MERKLE_ROOTS_FILENAME: &str = "merkle_onion_roots.bin";
+pub const ONION_MERKLE_ROOT_FILENAME: &str = "merkle_onion_root.bin";
+pub const ONION_MERKLE_CACHE_FROM_LEVEL: usize = 1;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
@@ -116,6 +120,13 @@ pub enum PipelineError {
     InvalidOnionIndexEntrySize {
         entry_size: usize,
         slot_size: usize,
+    },
+    InvalidOnionMerkleArity {
+        entry_size: usize,
+    },
+    InvalidBinHashes {
+        path: PathBuf,
+        reason: String,
     },
     InvalidIndexSize {
         bytes: u64,
@@ -189,6 +200,13 @@ impl fmt::Display for PipelineError {
                 f,
                 "onion index entry size {entry_size} cannot fit one {slot_size}-byte index slot"
             ),
+            PipelineError::InvalidOnionMerkleArity { entry_size } => write!(
+                f,
+                "onion Merkle entry size {entry_size} must be a nonzero multiple of {MERKLE_HASH_SIZE}"
+            ),
+            PipelineError::InvalidBinHashes { path, reason } => {
+                write!(f, "invalid bin hashes {}: {reason}", path.display())
+            }
             PipelineError::InvalidIndexSize { bytes } => {
                 write!(
                     f,
@@ -351,6 +369,32 @@ pub struct OnionIndexCuckooBuildReport {
     pub meta_file_bytes: u64,
     pub bin_hashes_file_bytes: u64,
     pub total_placements: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionMerkleOptions {
+    pub entry_size: usize,
+}
+
+impl Default for OnionMerkleOptions {
+    fn default() -> Self {
+        Self {
+            entry_size: DEFAULT_ONION_ENTRY_SIZE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnionMerkleBuildReport {
+    pub index_k: u32,
+    pub data_k: u32,
+    pub index_bins_per_table: u32,
+    pub data_bins_per_table: u32,
+    pub arity: u16,
+    pub tree_count: u32,
+    pub tree_tops_file_bytes: u64,
+    pub roots_file_bytes: u64,
+    pub super_root: [u8; MERKLE_HASH_SIZE],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +679,62 @@ pub fn build_onion_index_cuckoo(
         }
         Err(e) => {
             for path in [&bins_tmp, &meta_tmp, &bin_hashes_tmp] {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+pub fn build_onion_merkle(
+    index_bin_hashes_path: impl AsRef<Path>,
+    data_bin_hashes_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &OnionMerkleOptions,
+) -> Result<OnionMerkleBuildReport, PipelineError> {
+    validate_onion_entry_size(options.entry_size)?;
+    onion_merkle_arity(options.entry_size)?;
+
+    let index_bin_hashes_path = index_bin_hashes_path.as_ref();
+    let data_bin_hashes_path = data_bin_hashes_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let tree_tops_path = out_dir.join(ONION_MERKLE_TREE_TOPS_FILENAME);
+    let roots_path = out_dir.join(ONION_MERKLE_ROOTS_FILENAME);
+    let root_path = out_dir.join(ONION_MERKLE_ROOT_FILENAME);
+    for path in [&tree_tops_path, &roots_path, &root_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let tree_tops_tmp = temp_path(&tree_tops_path);
+    let roots_tmp = temp_path(&roots_path);
+    let root_tmp = temp_path(&root_path);
+    for path in [&tree_tops_tmp, &roots_tmp, &root_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result = build_onion_merkle_inner(
+        index_bin_hashes_path,
+        data_bin_hashes_path,
+        options,
+        &tree_tops_tmp,
+        &roots_tmp,
+        &root_tmp,
+    );
+    match result {
+        Ok(report) => {
+            std::fs::rename(&tree_tops_tmp, &tree_tops_path)?;
+            std::fs::rename(&roots_tmp, &roots_path)?;
+            std::fs::rename(&root_tmp, &root_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            for path in [&tree_tops_tmp, &roots_tmp, &root_tmp] {
                 let _ = std::fs::remove_file(path);
             }
             Err(e)
@@ -1737,6 +1837,58 @@ fn build_onion_index_cuckoo_inner(
     })
 }
 
+fn build_onion_merkle_inner(
+    index_bin_hashes_path: &Path,
+    data_bin_hashes_path: &Path,
+    options: &OnionMerkleOptions,
+    tree_tops_path: &Path,
+    roots_path: &Path,
+    root_path: &Path,
+) -> Result<OnionMerkleBuildReport, PipelineError> {
+    let arity = onion_merkle_arity(options.entry_size)?;
+    let index_hashes = read_onion_bin_hashes(index_bin_hashes_path)?;
+    let data_hashes = read_onion_bin_hashes(data_bin_hashes_path)?;
+
+    let index_trees = build_onion_tree_kind(
+        index_hashes.k,
+        index_hashes.bins_per_table,
+        &index_hashes.hashes,
+        arity,
+    );
+    let data_trees = build_onion_tree_kind(
+        data_hashes.k,
+        data_hashes.bins_per_table,
+        &data_hashes.hashes,
+        arity,
+    );
+
+    write_onion_tree_tops(tree_tops_path, &index_trees, &data_trees, arity)?;
+
+    let mut roots = Vec::with_capacity(index_trees.len() + data_trees.len());
+    roots.extend(index_trees.iter().map(|tree| tree.root));
+    roots.extend(data_trees.iter().map(|tree| tree.root));
+    write_roots(roots_path, &roots)?;
+
+    let mut super_preimage = Vec::with_capacity(roots.len() * MERKLE_HASH_SIZE);
+    for root in &roots {
+        super_preimage.extend_from_slice(root);
+    }
+    let super_root = sha256(&super_preimage);
+    std::fs::write(root_path, super_root)?;
+
+    Ok(OnionMerkleBuildReport {
+        index_k: index_hashes.k as u32,
+        data_k: data_hashes.k as u32,
+        index_bins_per_table: index_hashes.bins_per_table as u32,
+        data_bins_per_table: data_hashes.bins_per_table as u32,
+        arity: arity as u16,
+        tree_count: (index_hashes.k + data_hashes.k) as u32,
+        tree_tops_file_bytes: std::fs::metadata(tree_tops_path)?.len(),
+        roots_file_bytes: std::fs::metadata(roots_path)?.len(),
+        super_root,
+    })
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
@@ -1823,6 +1975,134 @@ fn onion_index_slots_per_bin(entry_size: usize) -> Result<usize, PipelineError> 
         });
     }
     Ok(slots_per_bin)
+}
+
+fn onion_merkle_arity(entry_size: usize) -> Result<usize, PipelineError> {
+    if entry_size == 0 || entry_size % MERKLE_HASH_SIZE != 0 {
+        return Err(PipelineError::InvalidOnionMerkleArity { entry_size });
+    }
+    Ok(entry_size / MERKLE_HASH_SIZE)
+}
+
+struct OnionBinHashes {
+    k: usize,
+    bins_per_table: usize,
+    hashes: Vec<Hash256>,
+}
+
+fn read_onion_bin_hashes(path: &Path) -> Result<OnionBinHashes, PipelineError> {
+    let data = std::fs::read(path)?;
+    if data.len() < 8 {
+        return Err(PipelineError::InvalidBinHashes {
+            path: path.to_path_buf(),
+            reason: "file too small for 8-byte header".into(),
+        });
+    }
+    let k = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let bins_per_table = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    if k == 0 || bins_per_table == 0 {
+        return Err(PipelineError::InvalidBinHashes {
+            path: path.to_path_buf(),
+            reason: format!("k={k}, bins_per_table={bins_per_table}; both must be nonzero"),
+        });
+    }
+    let total_bins =
+        k.checked_mul(bins_per_table)
+            .ok_or_else(|| PipelineError::InvalidBinHashes {
+                path: path.to_path_buf(),
+                reason: "k * bins_per_table overflow".into(),
+            })?;
+    let expected = 8 + total_bins * MERKLE_HASH_SIZE;
+    if data.len() != expected {
+        return Err(PipelineError::InvalidBinHashes {
+            path: path.to_path_buf(),
+            reason: format!("expected {expected} bytes, got {}", data.len()),
+        });
+    }
+
+    let mut hashes = Vec::with_capacity(total_bins);
+    for i in 0..total_bins {
+        let off = 8 + i * MERKLE_HASH_SIZE;
+        let mut h = [0u8; MERKLE_HASH_SIZE];
+        h.copy_from_slice(&data[off..off + MERKLE_HASH_SIZE]);
+        hashes.push(h);
+    }
+    Ok(OnionBinHashes {
+        k,
+        bins_per_table,
+        hashes,
+    })
+}
+
+fn build_onion_tree_kind(
+    k: usize,
+    bins_per_table: usize,
+    hashes: &[Hash256],
+    arity: usize,
+) -> Vec<PerGroupTree> {
+    (0..k)
+        .map(|group_id| {
+            let start = group_id * bins_per_table;
+            build_onion_group_tree(hashes[start..start + bins_per_table].to_vec(), arity)
+        })
+        .collect()
+}
+
+fn build_onion_group_tree(leaf_hashes: Vec<Hash256>, arity: usize) -> PerGroupTree {
+    let mut levels = vec![leaf_hashes];
+    loop {
+        let prev = levels.last().unwrap();
+        if prev.len() <= 1 {
+            break;
+        }
+        let mut next = Vec::with_capacity(prev.len().div_ceil(arity));
+        for i in 0..prev.len().div_ceil(arity) {
+            let start = i * arity;
+            let end = (start + arity).min(prev.len());
+            let mut children = prev[start..end].to_vec();
+            children.resize(arity, ZERO_HASH);
+            next.push(compute_parent_n(&children));
+        }
+        levels.push(next);
+    }
+    let root = levels.last().unwrap()[0];
+    PerGroupTree { levels, root }
+}
+
+fn write_onion_tree_tops(
+    path: &Path,
+    index_trees: &[PerGroupTree],
+    data_trees: &[PerGroupTree],
+    arity: usize,
+) -> Result<(), PipelineError> {
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(path)?);
+    writer.write_all(&((index_trees.len() + data_trees.len()) as u32).to_le_bytes())?;
+    for tree in index_trees.iter().chain(data_trees.iter()) {
+        write_one_tree_top_with_arity(&mut writer, tree, ONION_MERKLE_CACHE_FROM_LEVEL, arity)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_one_tree_top_with_arity<W: Write>(
+    writer: &mut W,
+    tree: &PerGroupTree,
+    cache_from_level: usize,
+    arity: usize,
+) -> Result<(), PipelineError> {
+    let num_cached_levels = tree.levels.len().saturating_sub(cache_from_level);
+    let total_nodes: usize = tree.levels[cache_from_level..].iter().map(Vec::len).sum();
+    writer.write_all(&[cache_from_level as u8])?;
+    writer.write_all(&(total_nodes as u32).to_le_bytes())?;
+    writer.write_all(&(arity as u16).to_le_bytes())?;
+    writer.write_all(&[num_cached_levels as u8])?;
+    for level in &tree.levels[cache_from_level..] {
+        writer.write_all(&(level.len() as u32).to_le_bytes())?;
+        for hash in level {
+            writer.write_all(hash)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_onion_index_entry<W: Write>(
@@ -2899,6 +3179,83 @@ mod tests {
                 [ONION_INDEX_META_HEADER_SIZE..ONION_INDEX_META_HEADER_SIZE + CHAIN_ANCHOR_BYTES],
             &regtest_anchor
         );
+
+        let onion_merkle_report1 = build_onion_merkle(
+            out1.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            out1.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &out1,
+            &OnionMerkleOptions::default(),
+        )
+        .expect("build onion merkle 1");
+        let onion_merkle_report2 = build_onion_merkle(
+            out2.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            out2.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &out2,
+            &OnionMerkleOptions::default(),
+        )
+        .expect("build onion merkle 2");
+        let expected_onion_merkle = OnionMerkleBuildReport {
+            index_k: 75,
+            data_k: 80,
+            index_bins_per_table: 1,
+            data_bins_per_table: 2,
+            arity: 104,
+            tree_count: 155,
+            tree_tops_file_bytes: 4_124,
+            roots_file_bytes: 4_960,
+            super_root: hash_from_hex(
+                "ba42763e4685f33a01e42337a63ab5e23619dd94035c6402fa9c76dfa28be518",
+            ),
+        };
+        assert_eq!(onion_merkle_report1, expected_onion_merkle);
+        assert_eq!(onion_merkle_report2, expected_onion_merkle);
+        for file in [
+            ONION_MERKLE_TREE_TOPS_FILENAME,
+            ONION_MERKLE_ROOTS_FILENAME,
+            ONION_MERKLE_ROOT_FILENAME,
+        ] {
+            assert_eq!(
+                std::fs::read(out1.join(file)).unwrap(),
+                std::fs::read(out2.join(file)).unwrap(),
+                "{file} differs across repeated builds"
+            );
+        }
+
+        let onion_merkle_anchor1 = dir.join("onion-merkle-anchor-1");
+        let onion_merkle_anchor2 = dir.join("onion-merkle-anchor-2");
+        let onion_merkle_anchor_report1 = build_onion_merkle(
+            onion_index_anchor1.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            onion_data_anchor1.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &onion_merkle_anchor1,
+            &OnionMerkleOptions::default(),
+        )
+        .expect("build anchored onion merkle 1");
+        let onion_merkle_anchor_report2 = build_onion_merkle(
+            onion_index_anchor2.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            onion_data_anchor2.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &onion_merkle_anchor2,
+            &OnionMerkleOptions::default(),
+        )
+        .expect("build anchored onion merkle 2");
+        let expected_onion_merkle_anchor = OnionMerkleBuildReport {
+            super_root: hash_from_hex(
+                "61aa94907bdeb13b3ff243c0e011ccf08d4c77cb78bbc6bb43cdec0c2eb9e64e",
+            ),
+            ..expected_onion_merkle
+        };
+        assert_eq!(onion_merkle_anchor_report1, expected_onion_merkle_anchor);
+        assert_eq!(onion_merkle_anchor_report2, expected_onion_merkle_anchor);
+        for file in [
+            ONION_MERKLE_TREE_TOPS_FILENAME,
+            ONION_MERKLE_ROOTS_FILENAME,
+            ONION_MERKLE_ROOT_FILENAME,
+        ] {
+            assert_eq!(
+                std::fs::read(onion_merkle_anchor1.join(file)).unwrap(),
+                std::fs::read(onion_merkle_anchor2.join(file)).unwrap(),
+                "{file} differs across repeated anchored builds"
+            );
+        }
 
         let cuckoo1 = dir.join("index-cuckoo-1.bin");
         let cuckoo2 = dir.join("index-cuckoo-2.bin");
