@@ -116,7 +116,13 @@ enclave-resident with pinned PCRs; browsers never parse them.
   pass, deterministic DPF/Harmony and Onion database stages, optional
   OnionPIR FFI preprocessing, root-bundle payload/signature/receipt, and
   sorted sha256 manifests for comparing a TEE build against a host or
-  another builder. `scripts/local-mainnet-build.sh` binds this to the
+  another builder. By default it also stages the server-loadable subset
+  under `server-db/` with a deterministic `MANIFEST.toml`; that directory
+  is the one a BitcoinPIR server should point at so startup verification
+  contributes a non-zero `manifest_roots` attestation commitment. The
+  `stage-server-db <out-dir> [server-db-dir]` subcommand can add the same
+  staging directory to an existing build output without re-running the
+  snapshot pipeline. `scripts/local-mainnet-build.sh` binds this to the
   owner's height-953383 mainnet snapshot and writes only to fresh
   timestamped directories under `/Volumes/Bitcoin`.
 
