@@ -103,9 +103,14 @@ enclave-resident with pinned PCRs; browsers never parse them.
   `generate-builder-key` + `sign-root-bundle` provide the plain-host
   Ed25519 signing path over that exact payload, and
   `verify-root-bundle` exposes the same k-of-n pinned-key quorum check
-  clients will eventually run in strict mode. The signer module keeps
-  this as a narrow provider boundary so an SEV/TDX/Nitro resident key can
-  later replace the local key file without changing the bundle format.
+  clients will eventually run in strict mode. `write-build-receipt`
+  emits a line-oriented audit receipt tying together the signed bundle
+  hash, source snapshot sha256/bytes, Core version string, anchor,
+  muhash, signers, and all payload roots; the receipt is intentionally
+  not a trust artifact, just the human/auditor index around the signed
+  bundle and later TEE quote. The signer module keeps this as a narrow
+  provider boundary so an SEV/TDX/Nitro resident key can later replace
+  the local key file without changing the bundle format.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

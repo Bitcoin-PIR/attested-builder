@@ -2,6 +2,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
+mod receipt;
 mod root_payload;
 mod signer;
 
@@ -44,6 +45,9 @@ fn main() -> ExitCode {
                 &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
                 &args[10],
             )
+        }
+        Some("write-build-receipt") if args.len() == 6 => {
+            receipt::write_build_receipt(&args[2], &args[3], &args[4], &args[5])
         }
         Some("generate-builder-key") if args.len() == 3 => signer::generate_builder_key(&args[2]),
         Some("sign-root-bundle") if args.len() == 5 => {
@@ -134,6 +138,7 @@ fn usage(bin: &str) {
   {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n\
   {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n\
   {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
+  {bin} write-build-receipt <signed-root-bundle.bin> <snapshot.dat> <core-version> <out-receipt.txt>\n\
   {bin} generate-builder-key <out-builder-key.txt>\n\
   {bin} sign-root-bundle <payload.bin> <builder-key.txt> <out-signed-root-bundle.bin>\n\
   {bin} verify-root-bundle <signed-root-bundle.bin> <threshold> <trusted-pubkey-hex> [trusted-pubkey-hex...]\n\
