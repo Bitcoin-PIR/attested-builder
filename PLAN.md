@@ -86,10 +86,20 @@ enclave-resident with pinned PCRs; browsers never parse them.
   stage. The pure root/top half of `gen_4_build_merkle_onion` is split:
   `onion_index_bin_hashes.bin` + `onion_data_bin_hashes.bin` →
   `merkle_onion_{tree_tops,roots,root}.bin` plus raw sibling-row inputs
-  `merkle_onion_sib_rows_{index,data}.bin`. The remaining Onion cuts
-  are the FFI-heavy data NTT store, Onion index
-  preprocessing/consolidation, and sibling-row preprocessing into
-  `merkle_onion_sib_{index,data}.bin`.
+  `merkle_onion_sib_rows_{index,data}.bin`.
+- `onionffi/` — optional-FFI wrappers for the C++ OnionPIR
+  preprocessing stages. The default build stays link-light and rejects
+  non-empty preprocessing; rebuilding with `--features ffi` enables
+  data NTT preprocessing (`onion_shared_ntt.bin`), consolidated Onion
+  index preprocessing (`onion_index_all.bin`), sibling-row
+  preprocessing (`merkle_onion_sib_{index,data}.bin`), and the
+  directory-level `preprocess-all` orchestration command.
+- `builder/` — `pir-attested-builder` CLI wrappers for the split stages.
+  It also emits unsigned canonical root-bundle payloads via
+  `build-root-bundle-payload`: given an output directory, network magic,
+  `chain_anchor.bin`, Core display muhash, layout bin counts, Onion entry
+  size, and `issued_at`, it records the DPF/Harmony and Onion super
+  roots plus SHA256 commitments for all known pipeline output files.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds

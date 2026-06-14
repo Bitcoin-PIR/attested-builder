@@ -321,6 +321,7 @@ dependencies = [
  "dbpipeline",
  "hex",
  "rootbundle",
+ "sha2",
  "utxosnapshot",
 ]
 
