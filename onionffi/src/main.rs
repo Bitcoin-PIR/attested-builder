@@ -8,6 +8,9 @@ fn main() -> ExitCode {
         Some("preprocess-sibling-rows") if args.len() == 4 => {
             preprocess_sibling_rows(&args[2], &args[3])
         }
+        Some("preprocess-data-ntt") if args.len() == 4 || args.len() == 5 => {
+            preprocess_data_ntt(&args)
+        }
         _ => {
             usage(&args[0]);
             ExitCode::from(2)
@@ -57,8 +60,38 @@ fn preprocess_sibling_rows(input: &str, output: &str) -> ExitCode {
     }
 }
 
+fn preprocess_data_ntt(args: &[String]) -> ExitCode {
+    let push_batch_entries = match args.get(4) {
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("error: push_batch_entries must be a positive integer: {s}");
+                return ExitCode::from(2);
+            }
+        },
+        None => onionffi::DEFAULT_PUSH_BATCH_ENTRIES,
+    };
+    let options = onionffi::DataNttOptions { push_batch_entries };
+
+    match onionffi::preprocess_data_ntt_file(&args[2], &args[3], &options) {
+        Ok(report) => {
+            println!("input_entries={}", report.input_entries);
+            println!("entry_size={}", report.entry_size);
+            println!("poly_degree={}", report.poly_degree);
+            println!("num_plaintexts={}", report.num_plaintexts);
+            println!("coeff_val_cnt={}", report.coeff_val_cnt);
+            println!("output_bytes={}", report.output_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn usage(bin: &str) {
     eprintln!(
-        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n\nNon-empty `preprocess-sibling-rows` inputs require rebuilding with `--features ffi`."
+        "usage:\n  {bin} inspect-sibling-rows <merkle_onion_sib_rows_*.bin>\n  {bin} preprocess-sibling-rows <merkle_onion_sib_rows_*.bin> <out-merkle_onion_sib_*.bin>\n  {bin} preprocess-data-ntt <onion_packed_entries.bin> <out-onion_shared_ntt.bin> [push_batch_entries]\n\nNon-empty preprocessing commands require rebuilding with `--features ffi`."
     );
 }
