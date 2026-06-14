@@ -101,7 +101,9 @@ enclave-resident with pinned PCRs; browsers never parse them.
   size, and `issued_at`, it records the DPF/Harmony and Onion super
   roots plus SHA256 commitments for all known pipeline output files.
   `generate-builder-key` + `sign-root-bundle` provide the plain-host
-  Ed25519 signing path over that exact payload; the signer module keeps
+  Ed25519 signing path over that exact payload, and
+  `verify-root-bundle` exposes the same k-of-n pinned-key quorum check
+  clients will eventually run in strict mode. The signer module keeps
   this as a narrow provider boundary so an SEV/TDX/Nitro resident key can
   later replace the local key file without changing the bundle format.
 

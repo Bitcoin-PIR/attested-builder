@@ -233,6 +233,142 @@ pub fn sign_root_bundle(payload: &str, key_file: &str, out_bundle: &str) -> Exit
     }
 }
 
+#[derive(Debug)]
+struct VerifyBundleReport {
+    bundle: rootbundle::SignedRootBundle,
+    valid_signatures: usize,
+    threshold: usize,
+    trusted_keys: usize,
+    bundle_bytes: usize,
+    bundle_sha256: [u8; 32],
+}
+
+fn parse_pubkey_hex(hex_key: &str, label: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_key.trim_start_matches("0x"))
+        .map_err(|e| format!("{label} must be 32-byte hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{label} must be 32 bytes, got {}", bytes.len()))
+}
+
+fn display_hash_hex(internal: &[u8; 32]) -> String {
+    let mut h = *internal;
+    h.reverse();
+    hex::encode(h)
+}
+
+fn build_kind_label(kind: rootbundle::BuildKind) -> &'static str {
+    match kind {
+        rootbundle::BuildKind::Snapshot => "snapshot",
+        rootbundle::BuildKind::Delta => "delta",
+    }
+}
+
+fn verify_root_bundle_file(
+    bundle_path: &Path,
+    threshold: usize,
+    trusted_pubkeys: &[[u8; 32]],
+) -> Result<VerifyBundleReport, String> {
+    if threshold == 0 {
+        return Err("threshold must be >= 1".to_owned());
+    }
+    if trusted_pubkeys.is_empty() {
+        return Err("at least one trusted pubkey is required".to_owned());
+    }
+    if threshold > trusted_pubkeys.len() {
+        return Err(format!(
+            "threshold {threshold} exceeds trusted key count {}",
+            trusted_pubkeys.len()
+        ));
+    }
+
+    let bytes = fs::read(bundle_path)
+        .map_err(|e| format!("failed to read bundle {}: {e}", bundle_path.display()))?;
+    let bundle = rootbundle::SignedRootBundle::decode(&bytes)
+        .map_err(|e| format!("failed to decode bundle {}: {e}", bundle_path.display()))?;
+    let valid_signatures = bundle
+        .verify_quorum(trusted_pubkeys, threshold)
+        .map_err(|e| format!("bundle quorum verification failed: {e}"))?;
+    Ok(VerifyBundleReport {
+        bundle,
+        valid_signatures,
+        threshold,
+        trusted_keys: trusted_pubkeys.len(),
+        bundle_bytes: bytes.len(),
+        bundle_sha256: Sha256::digest(&bytes).into(),
+    })
+}
+
+pub fn verify_root_bundle(
+    bundle_path: &str,
+    threshold: &str,
+    trusted_pubkeys: &[String],
+) -> ExitCode {
+    let threshold = match threshold.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("error: threshold must be a positive integer: {threshold}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let trusted = match trusted_pubkeys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| parse_pubkey_hex(key, &format!("trusted-pubkey-hex[{}]", i + 1)))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match verify_root_bundle_file(Path::new(bundle_path), threshold, &trusted) {
+        Ok(report) => {
+            let payload = &report.bundle.payload;
+            println!("status=ok");
+            println!("valid_signatures={}", report.valid_signatures);
+            println!("threshold={}", report.threshold);
+            println!("trusted_keys={}", report.trusted_keys);
+            println!("bundle_signatures={}", report.bundle.signatures.len());
+            for sig in &report.bundle.signatures {
+                println!("signer_pubkey={}", hex::encode(sig.signer_pubkey));
+            }
+            println!("network_magic={}", hex::encode(payload.network_magic));
+            println!("build_kind={}", build_kind_label(payload.build_kind));
+            println!("from_anchor_height={}", payload.from_anchor.height);
+            println!(
+                "from_anchor_hash={}",
+                display_hash_hex(&payload.from_anchor.block_hash)
+            );
+            println!("anchor_height={}", payload.anchor.height);
+            println!(
+                "anchor_hash={}",
+                display_hash_hex(&payload.anchor.block_hash)
+            );
+            println!("muhash={}", display_hash_hex(&payload.utxo_muhash));
+            println!("dust_threshold_sats={}", payload.dust_threshold_sats);
+            println!("max_utxos_per_spk={}", payload.max_utxos_per_spk);
+            println!("params_hash={}", hex::encode(payload.params_hash));
+            println!("issued_at={}", payload.issued_at);
+            println!("root_entries={}", payload.roots.len());
+            for root in &payload.roots {
+                println!("root:{}={}", root.label, hex::encode(root.root));
+            }
+            println!("bundle_bytes={}", report.bundle_bytes);
+            println!("bundle_sha256={}", hex::encode(report.bundle_sha256));
+            println!("bundle_path={bundle_path}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +429,33 @@ mod tests {
         assert!(report.bundle_bytes > 0);
         let expected_bundle_sha256: [u8; 32] = Sha256::digest(fs::read(&bundle).unwrap()).into();
         assert_eq!(report.bundle_sha256, expected_bundle_sha256);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verify_root_bundle_file_enforces_threshold_and_trusted_keys() {
+        let dir = unique_temp_dir("verify-bundle");
+        let key1 = dir.join("builder1.key");
+        let key2 = dir.join("builder2.key");
+        let payload = dir.join("payload.bin");
+        let bundle1 = dir.join("bundle1.bin");
+        let signer1 = write_local_key_file(&key1, [7u8; 32]).unwrap();
+        let signer2 = write_local_key_file(&key2, [8u8; 32]).unwrap();
+        fs::write(&payload, test_payload().encode().unwrap()).unwrap();
+        sign_root_bundle_files(&payload, &key1, &bundle1).unwrap();
+
+        let trusted = [signer1.public_key(), signer2.public_key()];
+        let report = verify_root_bundle_file(&bundle1, 1, &trusted).unwrap();
+        assert_eq!(report.valid_signatures, 1);
+        assert_eq!(report.threshold, 1);
+        assert_eq!(report.trusted_keys, 2);
+
+        let err = verify_root_bundle_file(&bundle1, 2, &trusted).unwrap_err();
+        assert!(err.contains("quorum not met"));
+
+        let err = verify_root_bundle_file(&bundle1, 1, &[signer2.public_key()]).unwrap_err();
+        assert!(err.contains("quorum not met"));
 
         fs::remove_dir_all(dir).unwrap();
     }
