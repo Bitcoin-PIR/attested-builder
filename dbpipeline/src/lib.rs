@@ -81,7 +81,12 @@ pub const ONION_DATA_CUCKOO_MAGIC: u64 = 0xBA7C_0010_0000_0001;
 pub const ONION_MERKLE_TREE_TOPS_FILENAME: &str = "merkle_onion_tree_tops.bin";
 pub const ONION_MERKLE_ROOTS_FILENAME: &str = "merkle_onion_roots.bin";
 pub const ONION_MERKLE_ROOT_FILENAME: &str = "merkle_onion_root.bin";
+pub const ONION_MERKLE_SIB_ROWS_INDEX_FILENAME: &str = "merkle_onion_sib_rows_index.bin";
+pub const ONION_MERKLE_SIB_ROWS_DATA_FILENAME: &str = "merkle_onion_sib_rows_data.bin";
 pub const ONION_MERKLE_CACHE_FROM_LEVEL: usize = 1;
+pub const ONION_MERKLE_SIB_ROWS_INDEX_MAGIC: u64 = 0xBA7C_0E52_0000_0000;
+pub const ONION_MERKLE_SIB_ROWS_DATA_MAGIC: u64 = 0xBA7C_0E52_0000_0001;
+pub const ONION_MERKLE_SIB_ROWS_HEADER_SIZE: usize = 24;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
@@ -392,8 +397,12 @@ pub struct OnionMerkleBuildReport {
     pub data_bins_per_table: u32,
     pub arity: u16,
     pub tree_count: u32,
+    pub index_sibling_rows_per_group: u32,
+    pub data_sibling_rows_per_group: u32,
     pub tree_tops_file_bytes: u64,
     pub roots_file_bytes: u64,
+    pub index_sibling_rows_file_bytes: u64,
+    pub data_sibling_rows_file_bytes: u64,
     pub super_root: [u8; MERKLE_HASH_SIZE],
 }
 
@@ -703,7 +712,15 @@ pub fn build_onion_merkle(
     let tree_tops_path = out_dir.join(ONION_MERKLE_TREE_TOPS_FILENAME);
     let roots_path = out_dir.join(ONION_MERKLE_ROOTS_FILENAME);
     let root_path = out_dir.join(ONION_MERKLE_ROOT_FILENAME);
-    for path in [&tree_tops_path, &roots_path, &root_path] {
+    let index_sibling_rows_path = out_dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME);
+    let data_sibling_rows_path = out_dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME);
+    for path in [
+        &tree_tops_path,
+        &roots_path,
+        &root_path,
+        &index_sibling_rows_path,
+        &data_sibling_rows_path,
+    ] {
         if path.exists() {
             return Err(PipelineError::OutputExists(path.clone()));
         }
@@ -712,7 +729,15 @@ pub fn build_onion_merkle(
     let tree_tops_tmp = temp_path(&tree_tops_path);
     let roots_tmp = temp_path(&roots_path);
     let root_tmp = temp_path(&root_path);
-    for path in [&tree_tops_tmp, &roots_tmp, &root_tmp] {
+    let index_sibling_rows_tmp = temp_path(&index_sibling_rows_path);
+    let data_sibling_rows_tmp = temp_path(&data_sibling_rows_path);
+    for path in [
+        &tree_tops_tmp,
+        &roots_tmp,
+        &root_tmp,
+        &index_sibling_rows_tmp,
+        &data_sibling_rows_tmp,
+    ] {
         if path.exists() {
             return Err(PipelineError::OutputExists(path.clone()));
         }
@@ -725,16 +750,26 @@ pub fn build_onion_merkle(
         &tree_tops_tmp,
         &roots_tmp,
         &root_tmp,
+        &index_sibling_rows_tmp,
+        &data_sibling_rows_tmp,
     );
     match result {
         Ok(report) => {
             std::fs::rename(&tree_tops_tmp, &tree_tops_path)?;
             std::fs::rename(&roots_tmp, &roots_path)?;
             std::fs::rename(&root_tmp, &root_path)?;
+            std::fs::rename(&index_sibling_rows_tmp, &index_sibling_rows_path)?;
+            std::fs::rename(&data_sibling_rows_tmp, &data_sibling_rows_path)?;
             Ok(report)
         }
         Err(e) => {
-            for path in [&tree_tops_tmp, &roots_tmp, &root_tmp] {
+            for path in [
+                &tree_tops_tmp,
+                &roots_tmp,
+                &root_tmp,
+                &index_sibling_rows_tmp,
+                &data_sibling_rows_tmp,
+            ] {
                 let _ = std::fs::remove_file(path);
             }
             Err(e)
@@ -1844,6 +1879,8 @@ fn build_onion_merkle_inner(
     tree_tops_path: &Path,
     roots_path: &Path,
     root_path: &Path,
+    index_sibling_rows_path: &Path,
+    data_sibling_rows_path: &Path,
 ) -> Result<OnionMerkleBuildReport, PipelineError> {
     let arity = onion_merkle_arity(options.entry_size)?;
     let index_hashes = read_onion_bin_hashes(index_bin_hashes_path)?;
@@ -1863,6 +1900,22 @@ fn build_onion_merkle_inner(
     );
 
     write_onion_tree_tops(tree_tops_path, &index_trees, &data_trees, arity)?;
+    let index_sibling_rows_per_group = onion_sibling_rows_per_group(&index_trees);
+    let data_sibling_rows_per_group = onion_sibling_rows_per_group(&data_trees);
+    let index_sibling_rows_file_bytes = write_onion_sibling_rows(
+        index_sibling_rows_path,
+        &index_trees,
+        arity,
+        options.entry_size,
+        ONION_MERKLE_SIB_ROWS_INDEX_MAGIC,
+    )?;
+    let data_sibling_rows_file_bytes = write_onion_sibling_rows(
+        data_sibling_rows_path,
+        &data_trees,
+        arity,
+        options.entry_size,
+        ONION_MERKLE_SIB_ROWS_DATA_MAGIC,
+    )?;
 
     let mut roots = Vec::with_capacity(index_trees.len() + data_trees.len());
     roots.extend(index_trees.iter().map(|tree| tree.root));
@@ -1883,8 +1936,12 @@ fn build_onion_merkle_inner(
         data_bins_per_table: data_hashes.bins_per_table as u32,
         arity: arity as u16,
         tree_count: (index_hashes.k + data_hashes.k) as u32,
+        index_sibling_rows_per_group: index_sibling_rows_per_group as u32,
+        data_sibling_rows_per_group: data_sibling_rows_per_group as u32,
         tree_tops_file_bytes: std::fs::metadata(tree_tops_path)?.len(),
         roots_file_bytes: std::fs::metadata(roots_path)?.len(),
+        index_sibling_rows_file_bytes,
+        data_sibling_rows_file_bytes,
         super_root,
     })
 }
@@ -2082,6 +2139,54 @@ fn write_onion_tree_tops(
     }
     writer.flush()?;
     Ok(())
+}
+
+fn onion_sibling_rows_per_group(trees: &[PerGroupTree]) -> usize {
+    trees
+        .first()
+        .and_then(|tree| tree.levels.get(ONION_MERKLE_CACHE_FROM_LEVEL))
+        .map_or(0, Vec::len)
+}
+
+fn write_onion_sibling_rows(
+    path: &Path,
+    trees: &[PerGroupTree],
+    arity: usize,
+    row_bytes: usize,
+    magic: u64,
+) -> Result<u64, PipelineError> {
+    let rows_per_group = onion_sibling_rows_per_group(trees);
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(path)?);
+    writer.write_all(&magic.to_le_bytes())?;
+    writer.write_all(&(trees.len() as u32).to_le_bytes())?;
+    writer.write_all(&(arity as u32).to_le_bytes())?;
+    writer.write_all(&(rows_per_group as u32).to_le_bytes())?;
+    writer.write_all(&(row_bytes as u32).to_le_bytes())?;
+
+    let mut row = vec![0u8; row_bytes];
+    for tree in trees {
+        let group_rows = tree
+            .levels
+            .get(ONION_MERKLE_CACHE_FROM_LEVEL)
+            .map_or(0, Vec::len);
+        debug_assert_eq!(group_rows, rows_per_group);
+        let leaves = &tree.levels[0];
+        for r in 0..rows_per_group {
+            row.fill(0);
+            for c in 0..arity {
+                let leaf_idx = r * arity + c;
+                if leaf_idx >= leaves.len() {
+                    break;
+                }
+                let dst = c * MERKLE_HASH_SIZE;
+                row[dst..dst + MERKLE_HASH_SIZE].copy_from_slice(&leaves[leaf_idx]);
+            }
+            writer.write_all(&row)?;
+        }
+    }
+    writer.flush()?;
+    Ok(ONION_MERKLE_SIB_ROWS_HEADER_SIZE as u64
+        + trees.len() as u64 * rows_per_group as u64 * row_bytes as u64)
 }
 
 fn write_one_tree_top_with_arity<W: Write>(
@@ -3201,8 +3306,12 @@ mod tests {
             data_bins_per_table: 2,
             arity: 104,
             tree_count: 155,
+            index_sibling_rows_per_group: 0,
+            data_sibling_rows_per_group: 1,
             tree_tops_file_bytes: 4_124,
             roots_file_bytes: 4_960,
+            index_sibling_rows_file_bytes: 24,
+            data_sibling_rows_file_bytes: 266_264,
             super_root: hash_from_hex(
                 "ba42763e4685f33a01e42337a63ab5e23619dd94035c6402fa9c76dfa28be518",
             ),
@@ -3213,6 +3322,8 @@ mod tests {
             ONION_MERKLE_TREE_TOPS_FILENAME,
             ONION_MERKLE_ROOTS_FILENAME,
             ONION_MERKLE_ROOT_FILENAME,
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
         ] {
             assert_eq!(
                 std::fs::read(out1.join(file)).unwrap(),
@@ -3249,6 +3360,8 @@ mod tests {
             ONION_MERKLE_TREE_TOPS_FILENAME,
             ONION_MERKLE_ROOTS_FILENAME,
             ONION_MERKLE_ROOT_FILENAME,
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
         ] {
             assert_eq!(
                 std::fs::read(onion_merkle_anchor1.join(file)).unwrap(),

@@ -300,8 +300,24 @@ fn build_onion_merkle(
             println!("data_bins_per_table={}", report.data_bins_per_table);
             println!("arity={}", report.arity);
             println!("tree_count={}", report.tree_count);
+            println!(
+                "index_sibling_rows_per_group={}",
+                report.index_sibling_rows_per_group
+            );
+            println!(
+                "data_sibling_rows_per_group={}",
+                report.data_sibling_rows_per_group
+            );
             println!("tree_tops_file_bytes={}", report.tree_tops_file_bytes);
             println!("roots_file_bytes={}", report.roots_file_bytes);
+            println!(
+                "index_sibling_rows_file_bytes={}",
+                report.index_sibling_rows_file_bytes
+            );
+            println!(
+                "data_sibling_rows_file_bytes={}",
+                report.data_sibling_rows_file_bytes
+            );
             println!("super_root={}", hex::encode(report.super_root));
             println!("entry_size={entry_size}");
             ExitCode::SUCCESS

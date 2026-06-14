@@ -85,9 +85,11 @@ enclave-resident with pinned PCRs; browsers never parse them.
   cuckoo/slot serialization out of the later OnionPIR preprocessing
   stage. The pure root/top half of `gen_4_build_merkle_onion` is split:
   `onion_index_bin_hashes.bin` + `onion_data_bin_hashes.bin` →
-  `merkle_onion_{tree_tops,roots,root}.bin`. The remaining Onion cuts
+  `merkle_onion_{tree_tops,roots,root}.bin` plus raw sibling-row inputs
+  `merkle_onion_sib_rows_{index,data}.bin`. The remaining Onion cuts
   are the FFI-heavy data NTT store, Onion index
-  preprocessing/consolidation, and Onion Merkle sibling DBs.
+  preprocessing/consolidation, and sibling-row preprocessing into
+  `merkle_onion_sib_{index,data}.bin`.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
