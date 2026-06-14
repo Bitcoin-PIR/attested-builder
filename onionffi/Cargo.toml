@@ -1,0 +1,13 @@
+[package]
+name = "onionffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Feature-gated OnionPIR FFI preprocessing helpers"
+
+[features]
+default = []
+ffi = ["dep:onionpir"]
+
+[dependencies]
+onionpir = { git = "https://github.com/Bitcoin-PIR/OnionPIRv2-fork.git", rev = "3f815ba86bc8cb2db5d892a006c1ee7fcbaf7e4b", optional = true }
