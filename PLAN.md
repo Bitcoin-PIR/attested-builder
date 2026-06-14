@@ -111,6 +111,14 @@ enclave-resident with pinned PCRs; browsers never parse them.
   bundle and later TEE quote. The signer module keeps this as a narrow
   provider boundary so an SEV/TDX/Nitro resident key can later replace
   the local key file without changing the bundle format.
+- `scripts/build-snapshot-database.sh` — the host/TEE orchestration
+  entrypoint for a real snapshot: one MuHash-verifying materialization
+  pass, deterministic DPF/Harmony and Onion database stages, optional
+  OnionPIR FFI preprocessing, root-bundle payload/signature/receipt, and
+  sorted sha256 manifests for comparing a TEE build against a host or
+  another builder. `scripts/local-mainnet-build.sh` binds this to the
+  owner's height-953383 mainnet snapshot and writes only to fresh
+  timestamped directories under `/Volumes/Bitcoin`.
 
 This is a standalone cargo workspace (NOT a member of the repo root
 workspace) pinned to the repo's vendored crate versions, so it builds
