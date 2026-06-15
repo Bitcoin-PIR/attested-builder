@@ -23,8 +23,8 @@ fn main() -> ExitCode {
         }
         Some("build-onion-data-cuckoo") if args.len() >= 4 => build_onion_data_cuckoo(&args),
         Some("build-onion-index-cuckoo") if args.len() >= 4 => build_onion_index_cuckoo(&args),
-        Some("build-onion-merkle") if args.len() == 5 || args.len() == 6 => {
-            build_onion_merkle(&args[2], &args[3], &args[4], args.get(5))
+        Some("build-onion-merkle") if (5..=7).contains(&args.len()) => {
+            build_onion_merkle(&args[2], &args[3], &args[4], &args[5..])
         }
         Some("build-index-cuckoo") if args.len() == 4 || args.len() == 6 => {
             match parse_optional_anchor(&args, 4) {
@@ -38,8 +38,8 @@ fn main() -> ExitCode {
                 Err(code) => code,
             }
         }
-        Some("build-bucket-merkle") if args.len() == 5 => {
-            build_bucket_merkle(&args[2], &args[3], &args[4])
+        Some("build-bucket-merkle") if args.len() == 5 || args.len() == 6 => {
+            build_bucket_merkle(&args[2], &args[3], &args[4], args.get(5))
         }
         Some("build-root-bundle-payload") if args.len() == 11 => {
             root_payload::build_root_bundle_payload(
@@ -152,10 +152,10 @@ fn usage(bin: &str) {
   {bin} build-onion-pack <utxo_set.bin> <out-dir> [entry-size]\n\
   {bin} build-onion-data-cuckoo <onion_packed_entries.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n\
   {bin} build-onion-index-cuckoo <onion_index.bin> <out-dir> [entry-size] [--anchor <chain_anchor.bin>]\n\
-  {bin} build-onion-merkle <onion_index_bin_hashes.bin> <onion_data_bin_hashes.bin> <out-dir> [entry-size]\n\
+  {bin} build-onion-merkle <onion_index_bin_hashes.bin> <onion_data_bin_hashes.bin> <out-dir> [entry-size] [--root-only]\n\
   {bin} build-index-cuckoo <utxo_chunks_index_nodust.bin> <out-batch_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n\
   {bin} build-chunk-cuckoo <utxo_chunks_nodust.bin> <out-chunk_pir_cuckoo.bin> [--anchor <chain_anchor.bin>]\n\
-  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n\
+  {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir> [--root-only]\n\
   {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} write-build-receipt <signed-root-bundle.bin> <snapshot.dat> <core-version> <out-receipt.txt>\n\
   {bin} write-build-evidence <out-dir> <snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
@@ -337,22 +337,19 @@ fn build_onion_merkle(
     index_bin_hashes: &str,
     data_bin_hashes: &str,
     out_dir: &str,
-    entry_size: Option<&String>,
+    optional_args: &[String],
 ) -> ExitCode {
-    let entry_size = match entry_size {
-        Some(s) => match s.parse::<usize>() {
-            Ok(n) if n > 0 && n <= u16::MAX as usize => n,
-            _ => {
-                eprintln!(
-                    "error: entry-size must be an integer in 1..={}: {s}",
-                    u16::MAX
-                );
-                return ExitCode::from(2);
-            }
-        },
-        None => dbpipeline::OnionMerkleOptions::default().entry_size,
+    let (entry_size, root_only) = match parse_entry_size_and_root_only(
+        optional_args,
+        dbpipeline::OnionMerkleOptions::default().entry_size,
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
     };
-    let options = dbpipeline::OnionMerkleOptions { entry_size };
+    let options = dbpipeline::OnionMerkleOptions {
+        entry_size,
+        root_only,
+    };
     match dbpipeline::build_onion_merkle(index_bin_hashes, data_bin_hashes, out_dir, &options) {
         Ok(report) => {
             println!("index_k={}", report.index_k);
@@ -388,6 +385,40 @@ fn build_onion_merkle(
             ExitCode::from(1)
         }
     }
+}
+
+fn parse_entry_size_and_root_only(
+    args: &[String],
+    default_entry_size: usize,
+) -> Result<(usize, bool), ExitCode> {
+    let mut entry_size = default_entry_size;
+    let mut root_only = false;
+    let mut saw_entry_size = false;
+
+    for arg in args {
+        if arg == "--root-only" {
+            root_only = true;
+        } else if saw_entry_size {
+            eprintln!("error: unexpected argument: {arg}");
+            return Err(ExitCode::from(2));
+        } else {
+            match arg.parse::<usize>() {
+                Ok(n) if n > 0 && n <= u16::MAX as usize => {
+                    entry_size = n;
+                    saw_entry_size = true;
+                }
+                _ => {
+                    eprintln!(
+                        "error: entry-size must be an integer in 1..={}: {arg}",
+                        u16::MAX
+                    );
+                    return Err(ExitCode::from(2));
+                }
+            }
+        }
+    }
+
+    Ok((entry_size, root_only))
 }
 
 fn parse_onion_entry_size_and_anchor<'a>(
@@ -474,8 +505,27 @@ fn build_chunk_cuckoo(chunks_file: &str, output_file: &str, anchor_path: Option<
     }
 }
 
-fn build_bucket_merkle(index_cuckoo: &str, chunk_cuckoo: &str, out_dir: &str) -> ExitCode {
-    match dbpipeline::build_bucket_merkle(index_cuckoo, chunk_cuckoo, out_dir) {
+fn build_bucket_merkle(
+    index_cuckoo: &str,
+    chunk_cuckoo: &str,
+    out_dir: &str,
+    mode: Option<&String>,
+) -> ExitCode {
+    let root_only = match mode.map(String::as_str) {
+        None => false,
+        Some("--root-only") => true,
+        Some(arg) => {
+            eprintln!("error: unexpected argument for build-bucket-merkle: {arg}");
+            return ExitCode::from(2);
+        }
+    };
+    let options = dbpipeline::BucketMerkleOptions { root_only };
+    match dbpipeline::build_bucket_merkle_with_options(
+        index_cuckoo,
+        chunk_cuckoo,
+        out_dir,
+        &options,
+    ) {
         Ok(report) => {
             println!("index_bins_per_table={}", report.index_bins_per_table);
             println!("chunk_bins_per_table={}", report.chunk_bins_per_table);

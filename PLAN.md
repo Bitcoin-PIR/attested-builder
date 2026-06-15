@@ -133,7 +133,14 @@ enclave-resident with pinned PCRs; browsers never parse them.
   contributes a non-zero `manifest_roots` attestation commitment. The
   `stage-server-db <out-dir> [server-db-dir]` subcommand can add the same
   staging directory to an existing build output without re-running the
-  snapshot pipeline. Full builds now also write `build-evidence.bin` and
+  snapshot pipeline. Setting `ROOTS_ONLY=1` switches the script into the
+  TEE proof mode used by the temporary builder UKI: it still computes the
+  database commitments through the existing deterministic stages, but
+  skips Merkle sibling/tree-top artifact writes and deletes large
+  serving/intermediate files as soon as the Merkle roots no longer need
+  them. It writes a small roots-only `server-db/MANIFEST.toml` for
+  evidence hashing. That manifest is not server-loadable. Full and
+  roots-only builds both write `build-evidence.bin` and
   `build-evidence.report-data` by default; setting `EMIT_SEV_SNP_QUOTE=1`
   additionally writes `build-evidence.sev-snp-report.bin` on a real
   SEV-SNP guest. `scripts/local-mainnet-build.sh` binds this to the

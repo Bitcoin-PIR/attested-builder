@@ -379,12 +379,14 @@ pub struct OnionIndexCuckooBuildReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnionMerkleOptions {
     pub entry_size: usize,
+    pub root_only: bool,
 }
 
 impl Default for OnionMerkleOptions {
     fn default() -> Self {
         Self {
             entry_size: DEFAULT_ONION_ENTRY_SIZE,
+            root_only: false,
         }
     }
 }
@@ -466,6 +468,11 @@ pub struct BucketMerkleBuildReport {
     pub tree_tops_file_bytes: u64,
     pub roots_file_bytes: u64,
     pub super_root: [u8; MERKLE_HASH_SIZE],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BucketMerkleOptions {
+    pub root_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -709,37 +716,27 @@ pub fn build_onion_merkle(
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
+    let root_path = out_dir.join(ONION_MERKLE_ROOT_FILENAME);
+    let mut output_paths = vec![root_path.clone()];
     let tree_tops_path = out_dir.join(ONION_MERKLE_TREE_TOPS_FILENAME);
     let roots_path = out_dir.join(ONION_MERKLE_ROOTS_FILENAME);
-    let root_path = out_dir.join(ONION_MERKLE_ROOT_FILENAME);
     let index_sibling_rows_path = out_dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME);
     let data_sibling_rows_path = out_dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME);
-    for path in [
-        &tree_tops_path,
-        &roots_path,
-        &root_path,
-        &index_sibling_rows_path,
-        &data_sibling_rows_path,
-    ] {
+    if !options.root_only {
+        output_paths.extend([
+            tree_tops_path.clone(),
+            roots_path.clone(),
+            index_sibling_rows_path.clone(),
+            data_sibling_rows_path.clone(),
+        ]);
+    }
+    for path in &output_paths {
         if path.exists() {
             return Err(PipelineError::OutputExists(path.clone()));
         }
-    }
-
-    let tree_tops_tmp = temp_path(&tree_tops_path);
-    let roots_tmp = temp_path(&roots_path);
-    let root_tmp = temp_path(&root_path);
-    let index_sibling_rows_tmp = temp_path(&index_sibling_rows_path);
-    let data_sibling_rows_tmp = temp_path(&data_sibling_rows_path);
-    for path in [
-        &tree_tops_tmp,
-        &roots_tmp,
-        &root_tmp,
-        &index_sibling_rows_tmp,
-        &data_sibling_rows_tmp,
-    ] {
-        if path.exists() {
-            return Err(PipelineError::OutputExists(path.clone()));
+        let tmp = temp_path(path);
+        if tmp.exists() {
+            return Err(PipelineError::OutputExists(tmp));
         }
     }
 
@@ -747,30 +744,22 @@ pub fn build_onion_merkle(
         index_bin_hashes_path,
         data_bin_hashes_path,
         options,
-        &tree_tops_tmp,
-        &roots_tmp,
-        &root_tmp,
-        &index_sibling_rows_tmp,
-        &data_sibling_rows_tmp,
+        &temp_path(&tree_tops_path),
+        &temp_path(&roots_path),
+        &temp_path(&root_path),
+        &temp_path(&index_sibling_rows_path),
+        &temp_path(&data_sibling_rows_path),
     );
     match result {
         Ok(report) => {
-            std::fs::rename(&tree_tops_tmp, &tree_tops_path)?;
-            std::fs::rename(&roots_tmp, &roots_path)?;
-            std::fs::rename(&root_tmp, &root_path)?;
-            std::fs::rename(&index_sibling_rows_tmp, &index_sibling_rows_path)?;
-            std::fs::rename(&data_sibling_rows_tmp, &data_sibling_rows_path)?;
+            for path in output_paths {
+                std::fs::rename(temp_path(&path), path)?;
+            }
             Ok(report)
         }
         Err(e) => {
-            for path in [
-                &tree_tops_tmp,
-                &roots_tmp,
-                &root_tmp,
-                &index_sibling_rows_tmp,
-                &data_sibling_rows_tmp,
-            ] {
-                let _ = std::fs::remove_file(path);
+            for path in output_paths {
+                let _ = std::fs::remove_file(temp_path(&path));
             }
             Err(e)
         }
@@ -844,6 +833,20 @@ pub fn build_bucket_merkle(
     chunk_cuckoo_path: impl AsRef<Path>,
     out_dir: impl AsRef<Path>,
 ) -> Result<BucketMerkleBuildReport, PipelineError> {
+    build_bucket_merkle_with_options(
+        index_cuckoo_path,
+        chunk_cuckoo_path,
+        out_dir,
+        &BucketMerkleOptions::default(),
+    )
+}
+
+pub fn build_bucket_merkle_with_options(
+    index_cuckoo_path: impl AsRef<Path>,
+    chunk_cuckoo_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &BucketMerkleOptions,
+) -> Result<BucketMerkleBuildReport, PipelineError> {
     let index_cuckoo_path = index_cuckoo_path.as_ref();
     let chunk_cuckoo_path = chunk_cuckoo_path.as_ref();
     let out_dir = out_dir.as_ref();
@@ -886,16 +889,16 @@ pub fn build_bucket_merkle(
 
     let index_sibling_levels = compute_sibling_levels(index_meta.bins_per_table);
     let chunk_sibling_levels = compute_sibling_levels(chunk_meta.bins_per_table);
-    let mut output_paths = vec![
-        out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME),
-        out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME),
-        out_dir.join(MERKLE_BUCKET_ROOT_FILENAME),
-    ];
-    for level in 0..index_sibling_levels.len() {
-        output_paths.push(out_dir.join(merkle_index_sibling_filename(level)));
-    }
-    for level in 0..chunk_sibling_levels.len() {
-        output_paths.push(out_dir.join(merkle_chunk_sibling_filename(level)));
+    let mut output_paths = vec![out_dir.join(MERKLE_BUCKET_ROOT_FILENAME)];
+    if !options.root_only {
+        output_paths.push(out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
+        output_paths.push(out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME));
+        for level in 0..index_sibling_levels.len() {
+            output_paths.push(out_dir.join(merkle_index_sibling_filename(level)));
+        }
+        for level in 0..chunk_sibling_levels.len() {
+            output_paths.push(out_dir.join(merkle_chunk_sibling_filename(level)));
+        }
     }
     for path in &output_paths {
         if path.exists() {
@@ -915,6 +918,7 @@ pub fn build_bucket_merkle(
         out_dir,
         &index_sibling_levels,
         &chunk_sibling_levels,
+        options,
     );
 
     match result {
@@ -1145,6 +1149,7 @@ fn build_bucket_merkle_inner(
     out_dir: &Path,
     index_sibling_levels: &[usize],
     chunk_sibling_levels: &[usize],
+    options: &BucketMerkleOptions,
 ) -> Result<BucketMerkleBuildReport, PipelineError> {
     let index_bin_size = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
     let chunk_bin_size = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
@@ -1172,42 +1177,52 @@ fn build_bucket_merkle_inner(
         })
         .collect();
 
-    for (level_idx, &num_groups) in index_sibling_levels.iter().enumerate() {
-        write_flat_sibling_table(
-            &temp_path(&out_dir.join(merkle_index_sibling_filename(level_idx))),
-            &index_trees,
-            level_idx,
-            num_groups,
-            INDEX_K,
-            bucket_sib_magic(0, level_idx as u8),
-        )?;
-    }
-    for (level_idx, &num_groups) in chunk_sibling_levels.iter().enumerate() {
-        write_flat_sibling_table(
-            &temp_path(&out_dir.join(merkle_chunk_sibling_filename(level_idx))),
-            &chunk_trees,
-            level_idx,
-            num_groups,
-            CHUNK_K,
-            bucket_sib_magic(1, level_idx as u8),
-        )?;
-    }
+    let tree_tops_file_bytes = if options.root_only {
+        0
+    } else {
+        for (level_idx, &num_groups) in index_sibling_levels.iter().enumerate() {
+            write_flat_sibling_table(
+                &temp_path(&out_dir.join(merkle_index_sibling_filename(level_idx))),
+                &index_trees,
+                level_idx,
+                num_groups,
+                INDEX_K,
+                bucket_sib_magic(0, level_idx as u8),
+            )?;
+        }
+        for (level_idx, &num_groups) in chunk_sibling_levels.iter().enumerate() {
+            write_flat_sibling_table(
+                &temp_path(&out_dir.join(merkle_chunk_sibling_filename(level_idx))),
+                &chunk_trees,
+                level_idx,
+                num_groups,
+                CHUNK_K,
+                bucket_sib_magic(1, level_idx as u8),
+            )?;
+        }
 
-    let tree_tops_path = temp_path(&out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
-    write_tree_tops(
-        &tree_tops_path,
-        &index_trees,
-        &chunk_trees,
-        index_sibling_levels,
-        chunk_sibling_levels,
-    )?;
+        let tree_tops_path = temp_path(&out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
+        write_tree_tops(
+            &tree_tops_path,
+            &index_trees,
+            &chunk_trees,
+            index_sibling_levels,
+            chunk_sibling_levels,
+        )?;
+        std::fs::metadata(&tree_tops_path)?.len()
+    };
 
     let mut roots = Vec::with_capacity(INDEX_K + CHUNK_K);
     roots.extend(index_trees.iter().map(|tree| tree.root));
     roots.extend(chunk_trees.iter().map(|tree| tree.root));
 
-    let roots_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME));
-    write_roots(&roots_path, &roots)?;
+    let roots_file_bytes = if options.root_only {
+        0
+    } else {
+        let roots_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME));
+        write_roots(&roots_path, &roots)?;
+        std::fs::metadata(&roots_path)?.len()
+    };
 
     let mut super_preimage = Vec::with_capacity(roots.len() * MERKLE_HASH_SIZE);
     for root in &roots {
@@ -1223,8 +1238,8 @@ fn build_bucket_merkle_inner(
         index_sibling_levels: index_sibling_levels.iter().map(|&n| n as u32).collect(),
         chunk_sibling_levels: chunk_sibling_levels.iter().map(|&n| n as u32).collect(),
         tree_count: (INDEX_K + CHUNK_K) as u32,
-        tree_tops_file_bytes: std::fs::metadata(&tree_tops_path)?.len(),
-        roots_file_bytes: std::fs::metadata(&roots_path)?.len(),
+        tree_tops_file_bytes,
+        roots_file_bytes,
         super_root,
     })
 }
@@ -1899,28 +1914,43 @@ fn build_onion_merkle_inner(
         arity,
     );
 
-    write_onion_tree_tops(tree_tops_path, &index_trees, &data_trees, arity)?;
     let index_sibling_rows_per_group = onion_sibling_rows_per_group(&index_trees);
     let data_sibling_rows_per_group = onion_sibling_rows_per_group(&data_trees);
-    let index_sibling_rows_file_bytes = write_onion_sibling_rows(
-        index_sibling_rows_path,
-        &index_trees,
-        arity,
-        options.entry_size,
-        ONION_MERKLE_SIB_ROWS_INDEX_MAGIC,
-    )?;
-    let data_sibling_rows_file_bytes = write_onion_sibling_rows(
-        data_sibling_rows_path,
-        &data_trees,
-        arity,
-        options.entry_size,
-        ONION_MERKLE_SIB_ROWS_DATA_MAGIC,
-    )?;
+    let (tree_tops_file_bytes, index_sibling_rows_file_bytes, data_sibling_rows_file_bytes) =
+        if options.root_only {
+            (0, 0, 0)
+        } else {
+            write_onion_tree_tops(tree_tops_path, &index_trees, &data_trees, arity)?;
+            let index_bytes = write_onion_sibling_rows(
+                index_sibling_rows_path,
+                &index_trees,
+                arity,
+                options.entry_size,
+                ONION_MERKLE_SIB_ROWS_INDEX_MAGIC,
+            )?;
+            let data_bytes = write_onion_sibling_rows(
+                data_sibling_rows_path,
+                &data_trees,
+                arity,
+                options.entry_size,
+                ONION_MERKLE_SIB_ROWS_DATA_MAGIC,
+            )?;
+            (
+                std::fs::metadata(tree_tops_path)?.len(),
+                index_bytes,
+                data_bytes,
+            )
+        };
 
     let mut roots = Vec::with_capacity(index_trees.len() + data_trees.len());
     roots.extend(index_trees.iter().map(|tree| tree.root));
     roots.extend(data_trees.iter().map(|tree| tree.root));
-    write_roots(roots_path, &roots)?;
+    let roots_file_bytes = if options.root_only {
+        0
+    } else {
+        write_roots(roots_path, &roots)?;
+        std::fs::metadata(roots_path)?.len()
+    };
 
     let mut super_preimage = Vec::with_capacity(roots.len() * MERKLE_HASH_SIZE);
     for root in &roots {
@@ -1938,8 +1968,8 @@ fn build_onion_merkle_inner(
         tree_count: (index_hashes.k + data_hashes.k) as u32,
         index_sibling_rows_per_group: index_sibling_rows_per_group as u32,
         data_sibling_rows_per_group: data_sibling_rows_per_group as u32,
-        tree_tops_file_bytes: std::fs::metadata(tree_tops_path)?.len(),
-        roots_file_bytes: std::fs::metadata(roots_path)?.len(),
+        tree_tops_file_bytes,
+        roots_file_bytes,
         index_sibling_rows_file_bytes,
         data_sibling_rows_file_bytes,
         super_root,
@@ -3356,6 +3386,41 @@ mod tests {
         };
         assert_eq!(onion_merkle_anchor_report1, expected_onion_merkle_anchor);
         assert_eq!(onion_merkle_anchor_report2, expected_onion_merkle_anchor);
+        let onion_merkle_root_only = dir.join("onion-merkle-root-only");
+        let onion_merkle_root_only_report = build_onion_merkle(
+            onion_index_anchor1.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            onion_data_anchor1.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &onion_merkle_root_only,
+            &OnionMerkleOptions {
+                root_only: true,
+                ..Default::default()
+            },
+        )
+        .expect("build anchored onion merkle root-only");
+        assert_eq!(
+            onion_merkle_root_only_report,
+            OnionMerkleBuildReport {
+                tree_tops_file_bytes: 0,
+                roots_file_bytes: 0,
+                index_sibling_rows_file_bytes: 0,
+                data_sibling_rows_file_bytes: 0,
+                ..expected_onion_merkle_anchor
+            }
+        );
+        assert!(onion_merkle_root_only
+            .join(ONION_MERKLE_ROOT_FILENAME)
+            .exists());
+        for file in [
+            ONION_MERKLE_TREE_TOPS_FILENAME,
+            ONION_MERKLE_ROOTS_FILENAME,
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
+        ] {
+            assert!(
+                !onion_merkle_root_only.join(file).exists(),
+                "{file} should not exist in root-only mode"
+            );
+        }
         for file in [
             ONION_MERKLE_TREE_TOPS_FILENAME,
             ONION_MERKLE_ROOTS_FILENAME,
@@ -3561,6 +3626,31 @@ mod tests {
                 ),
             }
         );
+        let merkle_anchor_root_only = dir.join("merkle-anchor-root-only");
+        let merkle_anchor_root_only_report = build_bucket_merkle_with_options(
+            &anchored_index_cuckoo,
+            &anchor_seed_chunk_cuckoo,
+            &merkle_anchor_root_only,
+            &BucketMerkleOptions { root_only: true },
+        )
+        .expect("build anchored bucket merkle root-only");
+        assert_eq!(
+            merkle_anchor_root_only_report,
+            BucketMerkleBuildReport {
+                tree_tops_file_bytes: 0,
+                roots_file_bytes: 0,
+                ..merkle_anchor_report
+            }
+        );
+        assert!(merkle_anchor_root_only
+            .join(MERKLE_BUCKET_ROOT_FILENAME)
+            .exists());
+        assert!(!merkle_anchor_root_only
+            .join(MERKLE_BUCKET_TREE_TOPS_FILENAME)
+            .exists());
+        assert!(!merkle_anchor_root_only
+            .join(MERKLE_BUCKET_ROOTS_FILENAME)
+            .exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
