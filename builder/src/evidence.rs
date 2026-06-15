@@ -625,14 +625,16 @@ impl BuildEvidence {
     fn with_layout_from_summary(mut self, out_dir: &Path) -> Result<Self, String> {
         let summary = out_dir.join("build-summary.txt");
         self.index_bins_per_table = read_summary_u32(&summary, "index_bins_per_table")?
-            .or(read_summary_u32(
-                &out_dir.join("logs/03-build-index-cuckoo.out"),
+            .or(read_stage_log_u32(
+                out_dir,
+                "-build-index-cuckoo.out",
                 "bins_per_table",
             )?)
             .unwrap_or(self.index_bins_per_table);
         self.chunk_bins_per_table = read_summary_u32(&summary, "chunk_bins_per_table")?
-            .or(read_summary_u32(
-                &out_dir.join("logs/04-build-chunk-cuckoo.out"),
+            .or(read_stage_log_u32(
+                out_dir,
+                "-build-chunk-cuckoo.out",
                 "bins_per_table",
             )?)
             .unwrap_or(self.chunk_bins_per_table);
@@ -655,6 +657,37 @@ impl BuildEvidence {
         }
         Ok(self)
     }
+}
+
+fn read_stage_log_u32(
+    out_dir: &Path,
+    filename_suffix: &str,
+    key: &str,
+) -> Result<Option<u32>, String> {
+    let logs_dir = out_dir.join("logs");
+    let Ok(entries) = fs::read_dir(&logs_dir) else {
+        return Ok(None);
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read {}: {e}", logs_dir.display()))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.ends_with(filename_suffix) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+
+    for path in paths {
+        if let Some(value) = read_summary_u32(&path, key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn read_summary_u32(path: &Path, key: &str) -> Result<Option<u32>, String> {
@@ -1068,5 +1101,41 @@ mod tests {
         let mut evidence = sample_evidence();
         evidence.core_version = "bad\nversion".into();
         assert!(evidence.encode().unwrap_err().contains("newline"));
+    }
+
+    #[test]
+    fn layout_fallback_reads_numbered_delta_stage_logs() {
+        let unique = format!(
+            "pir-attested-builder-evidence-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("06-build-index-cuckoo.out"),
+            "started_at=now\nbins_per_table=53282\n",
+        )
+        .unwrap();
+        fs::write(
+            logs.join("07-build-chunk-cuckoo.out"),
+            "started_at=now\nbins_per_table=112332\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_stage_log_u32(&dir, "-build-index-cuckoo.out", "bins_per_table").unwrap(),
+            Some(53282)
+        );
+        assert_eq!(
+            read_stage_log_u32(&dir, "-build-chunk-cuckoo.out", "bins_per_table").unwrap(),
+            Some(112332)
+        );
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }
