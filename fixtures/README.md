@@ -75,34 +75,84 @@ committed `.dat` + the strings above are the canonical golden pair.
 
 ---
 
-## 2. Mainnet anchor snapshot (metadata only — file stays on the SSD)
+## 2. Mainnet production snapshots (metadata only — files stay on SSD)
 
-File (NOT committed): `/Volumes/Bitcoin/data/archive/txoutset_953383.dat`
+These are the full and delta anchors used by the deployed production
+databases:
+
+- full snapshot: height `948454`
+- delta snapshot range: `940611 -> 948454`
+
+Files (NOT committed):
+
+- `/Volumes/Bitcoin/data/archive/txoutset_940611.dat`
+- `/Volumes/Bitcoin/data/archive/txoutset_948454.dat`
+
+Important: `dumptxoutset`'s `txoutset_hash` is Core's serialized UTXO
+set hash, not the MuHash printed by `gettxoutsetinfo muhash`. The
+MuHash strings below were collected by temporarily rolling the owner's
+node tip to the target height and running `gettxoutsetinfo muhash`
+without a height argument.
+
+### Height 940611 (delta base)
 
 | field | value |
 |---|---|
 | network | mainnet |
-| anchor height | `953383` (tip 953389 − 6 at capture time) |
-| anchor block hash | `00000000000000000001d1ef626ec834feeb2aee2c9a1ec130d4b430337125e1` |
-| **muhash** | `adbbcf0147d6a651cae435bece956566c091a3eaa45a8ddd070bbf437fbe8880` |
-| txouts (coins) | `165743625` |
-| transactions | `114753780` |
-| total_amount | `20041594.88997129` |
-| bogosize | `12982949293` |
-| `dumptxoutset` coins_written | `165743625` (== txouts above — same state) |
-| `dumptxoutset` txoutset_hash | `64c9a2c9214e32389484765eff4c3617abf5277118278c2727f141846a80c347` |
-| `dumptxoutset` nchaintx | `1375068330` |
-| file sha256 | `109dbb62d959d1e42faf3577523d30823fab8346846b5c959bf7f7fb87f49d59` |
-| file size | `9470351881` bytes |
+| anchor height | `940611` |
+| anchor block hash | `000000000000000000002c41243b3d74d135942031ef15f547bca1ce8f85eb99` |
+| **muhash** | `aebb29df12e045ef5279036263aba3b8f8e9e816e05b04a58f57e63b3b25756b` |
+| txouts (coins) | `164933964` |
+| transactions | `114370461` |
+| total_amount | `20001682.40568506` |
+| bogosize | `12922335176` |
+| disk_size | `11929809225` |
+| `dumptxoutset` coins_written | `164933964` |
+| `dumptxoutset` txoutset_hash | `7735b95d64487636058bb1b1100b77bcfb2101cf3b64296d3efe5a6b0a8f472f` |
+| `dumptxoutset` nchaintx | `1322729182` |
+| file sha256 | `f864896ea6d9789a7d0f7d21e1405096f4e44a7bd674cdeca1b8ac354980d8c8` |
+| file size | `9427476008` bytes |
+
+### Height 948454 (production full snapshot / delta target)
+
+| field | value |
+|---|---|
+| network | mainnet |
+| anchor height | `948454` |
+| anchor block hash | `00000000000000000001ef683c02c383315db7e917c69d20f79e05985560a4e4` |
+| **muhash** | `cf4fc1f1dd400622a5b6f39eca7f764a30570c30cc668e04f00e8a3356c2a2ee` |
+| txouts (coins) | `164832143` |
+| transactions | `114175147` |
+| total_amount | `20026191.77820969` |
+| bogosize | `12916260017` |
+| disk_size | `11429516552` |
+| `dumptxoutset` coins_written | `164832143` |
+| `dumptxoutset` txoutset_hash | `76d2152dffaf63f281d424be7895e4d376633e369e9f285e127e8c800cce73cf` |
+| `dumptxoutset` nchaintx | `1352911466` |
+| file sha256 | `e5ed70c794830d6db2d7ebb7ad3965b126067457a977f370ec5e876139dcf6ff` |
+| file size | `9422874286` bytes |
 
 Method note: this node runs without `-coinstatsindex`, so
-`gettxoutsetinfo muhash <height>` is unavailable. The anchor muhash
-was computed by `invalidateblock <hash(anchor+1)>` →
-`gettxoutsetinfo muhash` (tip == anchor) → `reconsiderblock` — the
-same temporary-rollback semantics `dumptxoutset rollback=<height>`
-uses internally. The snapshot itself was produced with
-`bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset <path>
-rollback=953383`.
+`gettxoutsetinfo muhash <height>` is unavailable. For each anchor, the
+node was temporarily moved to that tip with
+`invalidateblock <hash(anchor+1)>`, queried with `gettxoutsetinfo
+muhash`, then restored with `reconsiderblock`. Snapshot files were
+produced with `bitcoin-cli -rpcclienttimeout=0 -named dumptxoutset
+<path> rollback=<height>`.
+
+The delta builder path binds both anchors. The TEE should verify both
+snapshot files against the MuHash values above, materialize the two flat
+UTXO sets, and compute the deterministic set difference internally:
+
+- `from` anchor: height `940611`, MuHash
+  `aebb29df12e045ef5279036263aba3b8f8e9e816e05b04a58f57e63b3b25756b`
+- `to` anchor: height `948454`, MuHash
+  `cf4fc1f1dd400622a5b6f39eca7f764a30570c30cc668e04f00e8a3356c2a2ee`
+- script entry point: `scripts/build-delta-database.sh`
+
+This avoids trusting a host-side block replay log for the delta: the
+trusted computation is "two Core snapshots + two MuHashes -> deterministic
+plus/minus delta -> Merkle roots/root bundle".
 
 ---
 

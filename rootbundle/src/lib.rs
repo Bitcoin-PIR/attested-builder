@@ -33,6 +33,7 @@ pub const PAYLOAD_VERSION: u16 = 1;
 pub const MAX_ROOTS: usize = 1024;
 pub const MAX_LABEL_LEN: usize = 64;
 pub const CHAIN_ANCHOR_BYTES: usize = 36;
+pub const DELTA_ANCHOR_BYTES: usize = CHAIN_ANCHOR_BYTES * 2;
 
 /// What was built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,44 @@ impl ChainAnchor {
     }
 }
 
+/// A delta's chain anchor: the snapshot it applies to plus the resulting
+/// chain state. This is the seed context for delta DB cuckoo layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaAnchor {
+    pub from: ChainAnchor,
+    pub to: ChainAnchor,
+}
+
+impl DeltaAnchor {
+    pub fn to_bytes(&self) -> [u8; DELTA_ANCHOR_BYTES] {
+        let mut out = [0u8; DELTA_ANCHOR_BYTES];
+        out[..CHAIN_ANCHOR_BYTES].copy_from_slice(&self.from.to_bytes());
+        out[CHAIN_ANCHOR_BYTES..].copy_from_slice(&self.to.to_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() != DELTA_ANCHOR_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DeltaAnchor expects {} bytes, got {}",
+                    DELTA_ANCHOR_BYTES,
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            from: ChainAnchor::from_bytes(&bytes[..CHAIN_ANCHOR_BYTES])?,
+            to: ChainAnchor::from_bytes(&bytes[CHAIN_ANCHOR_BYTES..])?,
+        })
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::from_bytes(&fs::read(path)?)
+    }
+}
+
 pub mod seed_domain {
     pub const INDEX_CUCKOO_MASTER: &str = "index/cuckoo/master";
     pub const CHUNK_CUCKOO_MASTER: &str = "chunk/cuckoo/master";
@@ -115,6 +154,13 @@ pub struct SnapshotSeeds {
     pub chunk_master: u64,
     pub index_tag: u64,
     pub merkle_data_master: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaSeeds {
+    pub index_master: u64,
+    pub chunk_master: u64,
+    pub index_tag: u64,
 }
 
 impl SnapshotSeeds {
@@ -131,12 +177,45 @@ impl SnapshotSeeds {
     }
 }
 
+impl DeltaSeeds {
+    pub fn derive(anchor: &DeltaAnchor) -> Self {
+        Self {
+            index_master: derive_delta_seed_u64(seed_domain::INDEX_CUCKOO_MASTER, anchor),
+            chunk_master: derive_delta_seed_u64(seed_domain::CHUNK_CUCKOO_MASTER, anchor),
+            index_tag: derive_delta_seed_u64(seed_domain::INDEX_TAG_FINGERPRINT, anchor),
+        }
+    }
+}
+
 pub fn derive_snapshot_seed_u64(domain: &str, anchor: &ChainAnchor) -> u64 {
     let bytes = tagged_snapshot_seed_hash(domain, anchor);
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
+pub fn derive_delta_seed_u64(domain: &str, anchor: &DeltaAnchor) -> u64 {
+    let bytes = tagged_delta_seed_hash(domain, anchor);
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+
 fn tagged_snapshot_seed_hash(domain: &str, anchor: &ChainAnchor) -> [u8; 32] {
+    tagged_seed_hash(domain, |h| {
+        h.update(b"snapshot/");
+        h.update(anchor.height.to_le_bytes());
+        h.update(anchor.block_hash);
+    })
+}
+
+fn tagged_delta_seed_hash(domain: &str, anchor: &DeltaAnchor) -> [u8; 32] {
+    tagged_seed_hash(domain, |h| {
+        h.update(b"delta/");
+        h.update(anchor.from.height.to_le_bytes());
+        h.update(anchor.from.block_hash);
+        h.update(anchor.to.height.to_le_bytes());
+        h.update(anchor.to.block_hash);
+    })
+}
+
+fn tagged_seed_hash(domain: &str, absorb: impl FnOnce(&mut Sha256)) -> [u8; 32] {
     let mut tag_hasher = Sha256::new();
     tag_hasher.update(SEED_TAG_PREFIX_V1);
     tag_hasher.update(domain.as_bytes());
@@ -145,9 +224,7 @@ fn tagged_snapshot_seed_hash(domain: &str, anchor: &ChainAnchor) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(tag_hash);
     h.update(tag_hash);
-    h.update(b"snapshot/");
-    h.update(anchor.height.to_le_bytes());
-    h.update(anchor.block_hash);
+    absorb(&mut h);
     h.finalize().into()
 }
 

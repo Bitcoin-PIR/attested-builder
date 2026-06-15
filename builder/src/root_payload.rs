@@ -68,6 +68,9 @@ fn known_pipeline_output_filenames() -> &'static [&'static str] {
     &[
         dbpipeline::UTXO_CHUNKS_FILENAME,
         dbpipeline::UTXO_CHUNKS_INDEX_FILENAME,
+        dbpipeline::DELTA_GROUPED_FILENAME,
+        dbpipeline::DELTA_CHUNKS_FILENAME,
+        dbpipeline::DELTA_INDEX_FILENAME,
         dbpipeline::TOP100_FILENAME,
         dbpipeline::WHALES_FILENAME,
         dbpipeline::INDEX_CUCKOO_FILENAME,
@@ -173,32 +176,35 @@ fn collect_payload_roots(out_dir: &Path) -> Result<Vec<rootbundle::NamedRoot>, S
 fn root_bundle_payload_from_dir(
     out_dir: &Path,
     network_magic: [u8; 4],
-    chain_anchor: rootbundle::ChainAnchor,
+    build_kind: rootbundle::BuildKind,
+    from_anchor: rootbundle::ChainAnchor,
+    anchor: rootbundle::ChainAnchor,
     muhash_display_hex: &str,
     index_bins_per_table: u32,
     chunk_bins_per_table: u32,
     onion_entry_size: u32,
     issued_at: i64,
+    extra_roots: Vec<rootbundle::NamedRoot>,
 ) -> Result<rootbundle::RootBundlePayload, String> {
     let params = rootbundle::BuildParamsV1::current_snapshot(
         index_bins_per_table,
         chunk_bins_per_table,
         onion_entry_size,
     );
+    let mut roots = collect_payload_roots(out_dir)?;
+    roots.extend(extra_roots);
+    roots.sort_by(|a, b| a.label.cmp(&b.label));
     Ok(rootbundle::RootBundlePayload {
         network_magic,
-        build_kind: rootbundle::BuildKind::Snapshot,
-        from_anchor: rootbundle::ChainAnchor {
-            block_hash: [0u8; 32],
-            height: 0,
-        },
-        anchor: chain_anchor,
+        build_kind,
+        from_anchor,
+        anchor,
         utxo_muhash: parse_muhash_display_hex(muhash_display_hex)?,
         dust_threshold_sats: dbpipeline::DUST_THRESHOLD_SATS,
         max_utxos_per_spk: dbpipeline::MAX_UTXOS_PER_SPK as u32,
         params_hash: params.params_hash(),
         issued_at,
-        roots: collect_payload_roots(out_dir)?,
+        roots,
     })
 }
 
@@ -251,12 +257,18 @@ pub fn build_root_bundle_payload(
         let payload = root_bundle_payload_from_dir(
             Path::new(out_dir),
             network_magic,
+            rootbundle::BuildKind::Snapshot,
+            rootbundle::ChainAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
             chain_anchor,
             muhash_display_hex,
             index_bins_per_table,
             chunk_bins_per_table,
             onion_entry_size,
             issued_at,
+            Vec::new(),
         )?;
         let (payload_bytes, payload_sha256) = write_payload_file(&payload, Path::new(out_payload))?;
         Ok::<_, String>((payload, payload_bytes, payload_sha256))
@@ -271,6 +283,79 @@ pub fn build_root_bundle_payload(
                 display_hash_hex(&payload.anchor.block_hash)
             );
             println!("muhash={muhash_display_hex}");
+            println!("params_hash={}", hex::encode(payload.params_hash));
+            println!("root_entries={}", payload.roots.len());
+            for root in &payload.roots {
+                println!("root:{}={}", root.label, hex::encode(root.root));
+            }
+            println!("payload_bytes={payload_bytes}");
+            println!("payload_sha256={}", hex::encode(payload_sha256));
+            println!("payload_path={out_payload}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+pub fn build_delta_root_bundle_payload(
+    out_dir: &str,
+    network_magic_hex: &str,
+    delta_anchor_path: &str,
+    from_muhash_display_hex: &str,
+    to_muhash_display_hex: &str,
+    index_bins_per_table: &str,
+    chunk_bins_per_table: &str,
+    onion_entry_size: &str,
+    issued_at: &str,
+    out_payload: &str,
+) -> ExitCode {
+    let result = (|| {
+        let network_magic = parse_hex_array::<4>(network_magic_hex, "network-magic-hex")?;
+        let delta_anchor = rootbundle::DeltaAnchor::load(delta_anchor_path)
+            .map_err(|e| format!("failed to read delta anchor {delta_anchor_path}: {e}"))?;
+        let index_bins_per_table = parse_u32_arg(index_bins_per_table, "index-bins-per-table")?;
+        let chunk_bins_per_table = parse_u32_arg(chunk_bins_per_table, "chunk-bins-per-table")?;
+        let onion_entry_size = parse_u32_arg(onion_entry_size, "onion-entry-size")?;
+        let issued_at = parse_i64_arg(issued_at, "issued-at-unix")?;
+        let from_muhash = parse_muhash_display_hex(from_muhash_display_hex)?;
+        let payload = root_bundle_payload_from_dir(
+            Path::new(out_dir),
+            network_magic,
+            rootbundle::BuildKind::Delta,
+            delta_anchor.from,
+            delta_anchor.to,
+            to_muhash_display_hex,
+            index_bins_per_table,
+            chunk_bins_per_table,
+            onion_entry_size,
+            issued_at,
+            vec![rootbundle::NamedRoot {
+                label: "input/from-utxo-muhash".to_owned(),
+                root: from_muhash,
+            }],
+        )?;
+        let (payload_bytes, payload_sha256) = write_payload_file(&payload, Path::new(out_payload))?;
+        Ok::<_, String>((payload, payload_bytes, payload_sha256))
+    })();
+
+    match result {
+        Ok((payload, payload_bytes, payload_sha256)) => {
+            println!("network_magic={}", hex::encode(payload.network_magic));
+            println!("build_kind=delta");
+            println!("from_anchor_height={}", payload.from_anchor.height);
+            println!(
+                "from_anchor_hash={}",
+                display_hash_hex(&payload.from_anchor.block_hash)
+            );
+            println!("anchor_height={}", payload.anchor.height);
+            println!(
+                "anchor_hash={}",
+                display_hash_hex(&payload.anchor.block_hash)
+            );
+            println!("muhash={to_muhash_display_hex}");
             println!("params_hash={}", hex::encode(payload.params_hash));
             println!("root_entries={}", payload.roots.len());
             for root in &payload.roots {
@@ -330,12 +415,18 @@ mod tests {
         let payload = root_bundle_payload_from_dir(
             &dir,
             [0xfa, 0xbf, 0xb5, 0xda],
+            rootbundle::BuildKind::Snapshot,
+            rootbundle::ChainAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
             rootbundle::ChainAnchor::load(&chain_anchor).unwrap(),
             display_muhash,
             8,
             16,
             dbpipeline::DEFAULT_ONION_ENTRY_SIZE as u32,
             1_800_000_000,
+            Vec::new(),
         )
         .unwrap();
         let (payload_bytes, payload_sha256) = write_payload_file(&payload, &out_payload).unwrap();

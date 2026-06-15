@@ -31,6 +31,9 @@ pub const TOP100_FILENAME: &str = "top100_addresses.bin";
 pub const WHALES_FILENAME: &str = "whale_addresses.txt";
 pub const INDEX_CUCKOO_FILENAME: &str = "batch_pir_cuckoo.bin";
 pub const CHUNK_CUCKOO_FILENAME: &str = "chunk_pir_cuckoo.bin";
+pub const DELTA_GROUPED_FILENAME: &str = "delta_grouped.bin";
+pub const DELTA_CHUNKS_FILENAME: &str = "delta_chunks.bin";
+pub const DELTA_INDEX_FILENAME: &str = "delta_index.bin";
 
 pub const INDEX_K: usize = 75;
 pub const INDEX_PBC_HASHES: usize = 3;
@@ -52,6 +55,8 @@ pub const CHUNK_CUCKOO_MAGIC: u64 = 0xBA7C_C000_C000_0002;
 pub const LEGACY_CHUNK_MASTER_SEED: u64 = 0xa3f7c2d918e4b065;
 pub const CHAIN_ANCHOR_BYTES: usize = 36;
 pub const ANCHOR_MAGIC_SNAPSHOT_XOR: u64 = 0x0000_0001_0000_0000;
+pub const DELTA_ANCHOR_BYTES: usize = CHAIN_ANCHOR_BYTES * 2;
+pub const ANCHOR_MAGIC_DELTA_XOR: u64 = 0x0000_0002_0000_0000;
 
 pub const MERKLE_ARITY: usize = 8;
 pub const MERKLE_HASH_SIZE: usize = 32;
@@ -98,6 +103,35 @@ const CUCKOO_KEY_MIX: u64 = 0x517cc1b727220a95;
 
 type Hash256 = [u8; MERKLE_HASH_SIZE];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderAnchorBytes {
+    Snapshot([u8; CHAIN_ANCHOR_BYTES]),
+    Delta([u8; DELTA_ANCHOR_BYTES]),
+}
+
+impl HeaderAnchorBytes {
+    fn len(&self) -> usize {
+        match self {
+            HeaderAnchorBytes::Snapshot(_) => CHAIN_ANCHOR_BYTES,
+            HeaderAnchorBytes::Delta(_) => DELTA_ANCHOR_BYTES,
+        }
+    }
+
+    fn magic(&self, legacy_magic: u64) -> u64 {
+        match self {
+            HeaderAnchorBytes::Snapshot(_) => legacy_magic ^ ANCHOR_MAGIC_SNAPSHOT_XOR,
+            HeaderAnchorBytes::Delta(_) => legacy_magic ^ ANCHOR_MAGIC_DELTA_XOR,
+        }
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        match self {
+            HeaderAnchorBytes::Snapshot(bytes) => writer.write_all(bytes),
+            HeaderAnchorBytes::Delta(bytes) => writer.write_all(bytes),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PipelineError {
     Io(io::Error),
@@ -138,6 +172,10 @@ pub enum PipelineError {
     },
     InvalidChunksSize {
         bytes: u64,
+    },
+    InvalidDeltaFormat {
+        path: PathBuf,
+        reason: String,
     },
     CuckooInsertFailed {
         group_id: usize,
@@ -223,6 +261,9 @@ impl fmt::Display for PipelineError {
                     f,
                     "chunks file size {bytes} is not divisible by {CHUNK_SIZE}"
                 )
+            }
+            PipelineError::InvalidDeltaFormat { path, reason } => {
+                write!(f, "invalid delta file {}: {reason}", path.display())
             }
             PipelineError::CuckooInsertFailed {
                 group_id,
@@ -323,6 +364,7 @@ pub struct OnionPackReport {
 pub struct OnionDataCuckooOptions {
     pub master_seed: u64,
     pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub delta_anchor: Option<[u8; DELTA_ANCHOR_BYTES]>,
     pub entry_size: usize,
 }
 
@@ -331,6 +373,7 @@ impl Default for OnionDataCuckooOptions {
         Self {
             master_seed: LEGACY_CHUNK_MASTER_SEED,
             snapshot_anchor: None,
+            delta_anchor: None,
             entry_size: DEFAULT_ONION_ENTRY_SIZE,
         }
     }
@@ -350,6 +393,7 @@ pub struct OnionIndexCuckooOptions {
     pub master_seed: u64,
     pub tag_seed: u64,
     pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub delta_anchor: Option<[u8; DELTA_ANCHOR_BYTES]>,
     pub entry_size: usize,
 }
 
@@ -359,6 +403,7 @@ impl Default for OnionIndexCuckooOptions {
             master_seed: LEGACY_INDEX_MASTER_SEED,
             tag_seed: LEGACY_INDEX_TAG_SEED,
             snapshot_anchor: None,
+            delta_anchor: None,
             entry_size: DEFAULT_ONION_ENTRY_SIZE,
         }
     }
@@ -413,6 +458,7 @@ pub struct IndexCuckooOptions {
     pub master_seed: u64,
     pub tag_seed: u64,
     pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub delta_anchor: Option<[u8; DELTA_ANCHOR_BYTES]>,
 }
 
 impl Default for IndexCuckooOptions {
@@ -421,6 +467,7 @@ impl Default for IndexCuckooOptions {
             master_seed: LEGACY_INDEX_MASTER_SEED,
             tag_seed: LEGACY_INDEX_TAG_SEED,
             snapshot_anchor: None,
+            delta_anchor: None,
         }
     }
 }
@@ -438,6 +485,7 @@ pub struct IndexCuckooBuildReport {
 pub struct ChunkCuckooOptions {
     pub master_seed: u64,
     pub snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    pub delta_anchor: Option<[u8; DELTA_ANCHOR_BYTES]>,
 }
 
 impl Default for ChunkCuckooOptions {
@@ -445,6 +493,7 @@ impl Default for ChunkCuckooOptions {
         Self {
             master_seed: LEGACY_CHUNK_MASTER_SEED,
             snapshot_anchor: None,
+            delta_anchor: None,
         }
     }
 }
@@ -456,6 +505,56 @@ pub struct ChunkCuckooBuildReport {
     pub slots_per_table: u64,
     pub output_bytes: u64,
     pub total_placements: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaBuildOptions {
+    pub dust_threshold_sats: u64,
+}
+
+impl Default for DeltaBuildOptions {
+    fn default() -> Self {
+        Self {
+            dust_threshold_sats: DUST_THRESHOLD_SATS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaBuildReport {
+    pub from_entries: u64,
+    pub to_entries: u64,
+    pub unchanged_entries: u64,
+    pub spent_entries: u64,
+    pub created_entries: u64,
+    pub dust_created_skipped: u64,
+    pub scripts_changed: u64,
+    pub grouped_file_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaChunkBuildReport {
+    pub scripts: u64,
+    pub chunks_written: u64,
+    pub index_entries: u64,
+    pub skipped_too_large: u64,
+    pub chunks_file_bytes: u64,
+    pub index_file_bytes: u64,
+    pub data_bytes: u64,
+    pub padding_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaOnionPackReport {
+    pub scripts: u64,
+    pub groups_packed: u64,
+    pub whale_spks_excluded: u64,
+    pub onion_entries: u64,
+    pub packed_file_bytes: u64,
+    pub index_file_bytes: u64,
+    pub data_bytes: u64,
+    pub padding_bytes: u64,
+    pub max_serialized_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,6 +589,31 @@ struct ShortenedEntry {
     vout: u32,
     amount: u64,
     height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct OutPointKey {
+    txid: [u8; TXID_SIZE],
+    vout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpentRef {
+    txid: [u8; TXID_SIZE],
+    vout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NewUtxo {
+    txid: [u8; TXID_SIZE],
+    vout: u32,
+    amount: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ScriptDelta {
+    spent: Vec<SpentRef>,
+    new_utxos: Vec<NewUtxo>,
 }
 
 type TopEntry = (usize, [u8; SCRIPT_HASH_SIZE], [u8; TXID_SIZE], u32);
@@ -761,6 +885,121 @@ pub fn build_onion_merkle(
             for path in output_paths {
                 let _ = std::fs::remove_file(temp_path(&path));
             }
+            Err(e)
+        }
+    }
+}
+
+pub fn build_grouped_delta_from_flat_sets(
+    from_flat_utxo_path: impl AsRef<Path>,
+    to_flat_utxo_path: impl AsRef<Path>,
+    out_grouped_delta_path: impl AsRef<Path>,
+    options: &DeltaBuildOptions,
+) -> Result<DeltaBuildReport, PipelineError> {
+    let from_flat_utxo_path = from_flat_utxo_path.as_ref();
+    let to_flat_utxo_path = to_flat_utxo_path.as_ref();
+    let out_grouped_delta_path = out_grouped_delta_path.as_ref();
+    if out_grouped_delta_path.exists() {
+        return Err(PipelineError::OutputExists(
+            out_grouped_delta_path.to_path_buf(),
+        ));
+    }
+    let tmp = temp_path(out_grouped_delta_path);
+    if tmp.exists() {
+        return Err(PipelineError::OutputExists(tmp));
+    }
+
+    let result = build_grouped_delta_from_flat_sets_inner(
+        from_flat_utxo_path,
+        to_flat_utxo_path,
+        &tmp,
+        options,
+    );
+
+    match result {
+        Ok(report) => {
+            std::fs::rename(&tmp, out_grouped_delta_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+pub fn build_delta_chunks(
+    grouped_delta_path: impl AsRef<Path>,
+    chunks_path: impl AsRef<Path>,
+    index_path: impl AsRef<Path>,
+) -> Result<DeltaChunkBuildReport, PipelineError> {
+    let grouped_delta_path = grouped_delta_path.as_ref();
+    let chunks_path = chunks_path.as_ref();
+    let index_path = index_path.as_ref();
+    for path in [chunks_path, index_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.to_path_buf()));
+        }
+    }
+    let chunks_tmp = temp_path(chunks_path);
+    let index_tmp = temp_path(index_path);
+    for path in [&chunks_tmp, &index_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result = build_delta_chunks_inner(grouped_delta_path, &chunks_tmp, &index_tmp);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&chunks_tmp, chunks_path)?;
+            std::fs::rename(&index_tmp, index_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&chunks_tmp);
+            let _ = std::fs::remove_file(&index_tmp);
+            Err(e)
+        }
+    }
+}
+
+pub fn build_delta_onion_pack(
+    grouped_delta_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    options: &OnionPackOptions,
+) -> Result<DeltaOnionPackReport, PipelineError> {
+    validate_onion_entry_size(options.entry_size)?;
+
+    let grouped_delta_path = grouped_delta_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    std::fs::create_dir_all(out_dir)?;
+
+    let packed_path = out_dir.join(ONION_PACKED_ENTRIES_FILENAME);
+    let index_path = out_dir.join(ONION_INDEX_FILENAME);
+    for path in [&packed_path, &index_path] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+    let packed_tmp = temp_path(&packed_path);
+    let index_tmp = temp_path(&index_path);
+    for path in [&packed_tmp, &index_tmp] {
+        if path.exists() {
+            return Err(PipelineError::OutputExists(path.clone()));
+        }
+    }
+
+    let result = build_delta_onion_pack_inner(grouped_delta_path, &packed_tmp, &index_tmp, options);
+    match result {
+        Ok(report) => {
+            std::fs::rename(&packed_tmp, packed_path)?;
+            std::fs::rename(&index_tmp, index_path)?;
+            Ok(report)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&packed_tmp);
+            let _ = std::fs::remove_file(&index_tmp);
             Err(e)
         }
     }
@@ -1262,15 +1501,18 @@ fn parse_cuckoo_meta(
     let magic = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let legacy_magic = expected_magic;
     let snapshot_magic = expected_magic ^ ANCHOR_MAGIC_SNAPSHOT_XOR;
+    let delta_magic = expected_magic ^ ANCHOR_MAGIC_DELTA_XOR;
     let anchor_len = if magic == legacy_magic {
         0
     } else if magic == snapshot_magic {
         CHAIN_ANCHOR_BYTES
+    } else if magic == delta_magic {
+        DELTA_ANCHOR_BYTES
     } else {
         return Err(PipelineError::InvalidCuckooHeader {
             path: path.to_path_buf(),
             reason: format!(
-                "bad magic 0x{magic:016x}; expected legacy 0x{legacy_magic:016x} or snapshot v2 0x{snapshot_magic:016x}"
+                "bad magic 0x{magic:016x}; expected legacy 0x{legacy_magic:016x}, snapshot v2 0x{snapshot_magic:016x}, or delta v2 0x{delta_magic:016x}"
             ),
         });
     };
@@ -1713,6 +1955,261 @@ fn build_onion_pack_inner(
     Ok(report)
 }
 
+fn build_grouped_delta_from_flat_sets_inner(
+    from_flat_utxo_path: &Path,
+    to_flat_utxo_path: &Path,
+    grouped_delta_path: &Path,
+    options: &DeltaBuildOptions,
+) -> Result<DeltaBuildReport, PipelineError> {
+    let from_bytes = std::fs::metadata(from_flat_utxo_path)?.len();
+    if from_bytes % FLAT_UTXO_ENTRY_SIZE as u64 != 0 {
+        return Err(PipelineError::InvalidFlatUtxoSize { bytes: from_bytes });
+    }
+    let to_bytes = std::fs::metadata(to_flat_utxo_path)?.len();
+    if to_bytes % FLAT_UTXO_ENTRY_SIZE as u64 != 0 {
+        return Err(PipelineError::InvalidFlatUtxoSize { bytes: to_bytes });
+    }
+    let from_entries = from_bytes / FLAT_UTXO_ENTRY_SIZE as u64;
+    let to_entries = to_bytes / FLAT_UTXO_ENTRY_SIZE as u64;
+
+    let mut from_map: HashMap<OutPointKey, [u8; SCRIPT_HASH_SIZE]> =
+        HashMap::with_capacity(from_entries as usize);
+    for entry in FlatEntryIter::open(from_flat_utxo_path)? {
+        let entry = entry?;
+        let key = OutPointKey {
+            txid: entry.txid,
+            vout: entry.vout,
+        };
+        if from_map.insert(key, entry.script_hash).is_some() {
+            return Err(PipelineError::InvalidDeltaFormat {
+                path: from_flat_utxo_path.to_path_buf(),
+                reason: format!("duplicate outpoint {}:{}", hex::encode(key.txid), key.vout),
+            });
+        }
+    }
+
+    let mut deltas: HashMap<[u8; SCRIPT_HASH_SIZE], ScriptDelta> = HashMap::new();
+    let mut unchanged_entries = 0u64;
+    let mut created_entries = 0u64;
+    let mut dust_created_skipped = 0u64;
+
+    for entry in FlatEntryIter::open(to_flat_utxo_path)? {
+        let entry = entry?;
+        let key = OutPointKey {
+            txid: entry.txid,
+            vout: entry.vout,
+        };
+        if from_map.remove(&key).is_some() {
+            unchanged_entries += 1;
+            continue;
+        }
+        if entry.amount <= options.dust_threshold_sats {
+            dust_created_skipped += 1;
+            continue;
+        }
+        deltas
+            .entry(entry.script_hash)
+            .or_default()
+            .new_utxos
+            .push(NewUtxo {
+                txid: entry.txid,
+                vout: entry.vout,
+                amount: entry.amount,
+            });
+        created_entries += 1;
+    }
+
+    let spent_entries = from_map.len() as u64;
+    let mut spent: Vec<(OutPointKey, [u8; SCRIPT_HASH_SIZE])> = from_map.into_iter().collect();
+    spent.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (key, script_hash) in spent {
+        deltas.entry(script_hash).or_default().spent.push(SpentRef {
+            txid: key.txid,
+            vout: key.vout,
+        });
+    }
+
+    let mut delta_groups: Vec<_> = deltas.into_iter().collect();
+    delta_groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (_script_hash, delta) in &mut delta_groups {
+        delta
+            .spent
+            .sort_unstable_by(|a, b| a.txid.cmp(&b.txid).then_with(|| a.vout.cmp(&b.vout)));
+        delta.new_utxos.sort_unstable_by(|a, b| {
+            a.txid
+                .cmp(&b.txid)
+                .then_with(|| a.vout.cmp(&b.vout))
+                .then_with(|| a.amount.cmp(&b.amount))
+        });
+    }
+
+    let mut writer =
+        BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(grouped_delta_path)?);
+    if delta_groups.len() > u32::MAX as usize {
+        return Err(PipelineError::InvalidDeltaFormat {
+            path: grouped_delta_path.to_path_buf(),
+            reason: format!("too many changed scripts: {}", delta_groups.len()),
+        });
+    }
+    writer.write_all(&(delta_groups.len() as u32).to_le_bytes())?;
+    for (script_hash, delta) in &delta_groups {
+        writer.write_all(script_hash)?;
+        write_varint_to_writer(&mut writer, delta.spent.len() as u64)?;
+        for spent in &delta.spent {
+            writer.write_all(&spent.txid)?;
+            write_varint_to_writer(&mut writer, spent.vout as u64)?;
+        }
+        write_varint_to_writer(&mut writer, delta.new_utxos.len() as u64)?;
+        for new_utxo in &delta.new_utxos {
+            writer.write_all(&new_utxo.txid)?;
+            write_varint_to_writer(&mut writer, new_utxo.vout as u64)?;
+            write_varint_to_writer(&mut writer, new_utxo.amount)?;
+        }
+    }
+    writer.flush()?;
+    let grouped_file_bytes = std::fs::metadata(grouped_delta_path)?.len();
+
+    Ok(DeltaBuildReport {
+        from_entries,
+        to_entries,
+        unchanged_entries,
+        spent_entries,
+        created_entries,
+        dust_created_skipped,
+        scripts_changed: delta_groups.len() as u64,
+        grouped_file_bytes,
+    })
+}
+
+fn build_delta_chunks_inner(
+    grouped_delta_path: &Path,
+    chunks_path: &Path,
+    index_path: &Path,
+) -> Result<DeltaChunkBuildReport, PipelineError> {
+    let data = std::fs::read(grouped_delta_path)?;
+    let mut chunks_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(chunks_path)?);
+    let mut index_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(index_path)?);
+    let mut pos = 0usize;
+    let num_scripts = read_delta_u32(&data, &mut pos, grouped_delta_path)? as usize;
+    let mut next_chunk_id = 0u64;
+    let mut report = DeltaChunkBuildReport {
+        scripts: num_scripts as u64,
+        chunks_written: 0,
+        index_entries: 0,
+        skipped_too_large: 0,
+        chunks_file_bytes: 0,
+        index_file_bytes: 0,
+        data_bytes: 0,
+        padding_bytes: 0,
+    };
+
+    for _ in 0..num_scripts {
+        let (script_hash, delta_bytes) =
+            read_delta_group_body(&data, &mut pos, grouped_delta_path)?;
+        let num_chunks = delta_bytes.len().div_ceil(CHUNK_SIZE);
+        report.index_entries += 1;
+
+        if num_chunks > u8::MAX as usize {
+            write_index_entry(&mut index_writer, &script_hash, 0, 0)?;
+            report.skipped_too_large += 1;
+            continue;
+        }
+        if next_chunk_id > u32::MAX as u64 {
+            return Err(PipelineError::ChunkIdOverflow(next_chunk_id));
+        }
+
+        chunks_writer.write_all(delta_bytes)?;
+        let padding = num_chunks * CHUNK_SIZE - delta_bytes.len();
+        if padding > 0 {
+            chunks_writer.write_all(&ZERO_PAD[..padding])?;
+        }
+        write_index_entry(
+            &mut index_writer,
+            &script_hash,
+            next_chunk_id as u32,
+            num_chunks as u8,
+        )?;
+
+        next_chunk_id += num_chunks as u64;
+        report.chunks_written += num_chunks as u64;
+        report.data_bytes += delta_bytes.len() as u64;
+        report.padding_bytes += padding as u64;
+    }
+    if pos != data.len() {
+        return Err(PipelineError::InvalidDeltaFormat {
+            path: grouped_delta_path.to_path_buf(),
+            reason: format!("{} trailing bytes after grouped delta", data.len() - pos),
+        });
+    }
+    chunks_writer.flush()?;
+    index_writer.flush()?;
+    report.chunks_file_bytes = next_chunk_id * CHUNK_SIZE as u64;
+    report.index_file_bytes = report.index_entries * INDEX_RECORD_SIZE as u64;
+    Ok(report)
+}
+
+fn build_delta_onion_pack_inner(
+    grouped_delta_path: &Path,
+    packed_path: &Path,
+    index_path: &Path,
+    options: &OnionPackOptions,
+) -> Result<DeltaOnionPackReport, PipelineError> {
+    let data = std::fs::read(grouped_delta_path)?;
+    let packed_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(packed_path)?);
+    let mut packer = OnionPacker::new(packed_writer, options.entry_size);
+    let mut index_writer = BufWriter::with_capacity(1024 * 1024, File::create_new(index_path)?);
+    let mut pos = 0usize;
+    let num_scripts = read_delta_u32(&data, &mut pos, grouped_delta_path)? as usize;
+    let mut report = DeltaOnionPackReport {
+        scripts: num_scripts as u64,
+        groups_packed: 0,
+        whale_spks_excluded: 0,
+        onion_entries: 0,
+        packed_file_bytes: 0,
+        index_file_bytes: 0,
+        data_bytes: 0,
+        padding_bytes: 0,
+        max_serialized_len: 0,
+    };
+
+    for _ in 0..num_scripts {
+        let (script_hash, delta_bytes) =
+            read_delta_group_body(&data, &mut pos, grouped_delta_path)?;
+        report.max_serialized_len = report.max_serialized_len.max(delta_bytes.len());
+        if delta_bytes.len().div_ceil(options.entry_size) > u8::MAX as usize {
+            write_onion_index_entry(&mut index_writer, &script_hash, 0, 0, ONION_WHALE_FLAG)?;
+            report.whale_spks_excluded += 1;
+            continue;
+        }
+
+        let (entry_id, byte_offset, num_entries) = packer.pack(&script_hash, delta_bytes)?;
+        write_onion_index_entry(
+            &mut index_writer,
+            &script_hash,
+            entry_id,
+            byte_offset,
+            num_entries,
+        )?;
+        report.groups_packed += 1;
+    }
+    if pos != data.len() {
+        return Err(PipelineError::InvalidDeltaFormat {
+            path: grouped_delta_path.to_path_buf(),
+            reason: format!("{} trailing bytes after grouped delta", data.len() - pos),
+        });
+    }
+
+    packer.finish()?;
+    index_writer.flush()?;
+    report.onion_entries = packer.entry_count;
+    report.packed_file_bytes = packer.entry_count * options.entry_size as u64;
+    report.index_file_bytes =
+        (report.groups_packed + report.whale_spks_excluded) * ONION_INDEX_RECORD_SIZE as u64;
+    report.data_bytes = packer.total_data;
+    report.padding_bytes = packer.total_padding;
+    Ok(report)
+}
+
 fn build_onion_data_cuckoo_inner(
     packed_path: &Path,
     options: &OnionDataCuckooOptions,
@@ -1783,8 +2280,8 @@ fn build_onion_data_cuckoo_inner(
         options,
     )?;
 
-    let header_size =
-        ONION_DATA_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES);
+    let header_size = ONION_DATA_CUCKOO_HEADER_SIZE
+        + header_anchor(options.snapshot_anchor, options.delta_anchor).map_or(0, |a| a.len());
     Ok(OnionDataCuckooBuildReport {
         packed_entries,
         bins_per_table: bins_per_table_u32,
@@ -1871,7 +2368,8 @@ fn build_onion_index_cuckoo_inner(
 
     let raw_bins_file_bytes = INDEX_K as u64 * bins_per_table as u64 * options.entry_size as u64;
     let meta_file_bytes = ONION_INDEX_META_HEADER_SIZE as u64
-        + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES) as u64;
+        + header_anchor(options.snapshot_anchor, options.delta_anchor).map_or(0, |a| a.len())
+            as u64;
     let bin_hashes_file_bytes =
         8 + INDEX_K as u64 * bins_per_table as u64 * MERKLE_HASH_SIZE as u64;
 
@@ -1986,7 +2484,8 @@ fn write_index_cuckoo_header<W: Write>(
     bins_per_table: u32,
     options: &IndexCuckooOptions,
 ) -> Result<(), PipelineError> {
-    let magic = cuckoo_magic(INDEX_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    let anchor = header_anchor(options.snapshot_anchor, options.delta_anchor);
+    let magic = cuckoo_magic(INDEX_CUCKOO_MAGIC, anchor.as_ref());
     writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
     writer.write_all(&(INDEX_SLOTS_PER_BIN as u32).to_le_bytes())?;
@@ -1994,8 +2493,8 @@ fn write_index_cuckoo_header<W: Write>(
     writer.write_all(&(INDEX_PBC_HASHES as u32).to_le_bytes())?;
     writer.write_all(&options.master_seed.to_le_bytes())?;
     writer.write_all(&options.tag_seed.to_le_bytes())?;
-    if let Some(anchor) = options.snapshot_anchor {
-        writer.write_all(&anchor)?;
+    if let Some(anchor) = anchor {
+        anchor.write_to(writer)?;
     }
     Ok(())
 }
@@ -2005,33 +2504,46 @@ fn write_chunk_cuckoo_header<W: Write>(
     bins_per_table: u32,
     options: &ChunkCuckooOptions,
 ) -> Result<(), PipelineError> {
-    let magic = cuckoo_magic(CHUNK_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    let anchor = header_anchor(options.snapshot_anchor, options.delta_anchor);
+    let magic = cuckoo_magic(CHUNK_CUCKOO_MAGIC, anchor.as_ref());
     writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(CHUNK_K as u32).to_le_bytes())?;
     writer.write_all(&(CHUNK_SLOTS_PER_BIN as u32).to_le_bytes())?;
     writer.write_all(&bins_per_table.to_le_bytes())?;
     writer.write_all(&(CHUNK_PBC_HASHES as u32).to_le_bytes())?;
     writer.write_all(&options.master_seed.to_le_bytes())?;
-    if let Some(anchor) = options.snapshot_anchor {
-        writer.write_all(&anchor)?;
+    if let Some(anchor) = anchor {
+        anchor.write_to(writer)?;
     }
     Ok(())
 }
 
 fn index_cuckoo_header_size(options: &IndexCuckooOptions) -> usize {
-    INDEX_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES)
+    INDEX_CUCKOO_HEADER_SIZE
+        + header_anchor(options.snapshot_anchor, options.delta_anchor).map_or(0, |a| a.len())
 }
 
 fn chunk_cuckoo_header_size(options: &ChunkCuckooOptions) -> usize {
-    CHUNK_CUCKOO_HEADER_SIZE + options.snapshot_anchor.map_or(0, |_| CHAIN_ANCHOR_BYTES)
+    CHUNK_CUCKOO_HEADER_SIZE
+        + header_anchor(options.snapshot_anchor, options.delta_anchor).map_or(0, |a| a.len())
 }
 
-fn cuckoo_magic(legacy_magic: u64, has_snapshot_anchor: bool) -> u64 {
-    if has_snapshot_anchor {
-        legacy_magic ^ ANCHOR_MAGIC_SNAPSHOT_XOR
-    } else {
-        legacy_magic
+fn header_anchor(
+    snapshot_anchor: Option<[u8; CHAIN_ANCHOR_BYTES]>,
+    delta_anchor: Option<[u8; DELTA_ANCHOR_BYTES]>,
+) -> Option<HeaderAnchorBytes> {
+    match (snapshot_anchor, delta_anchor) {
+        (Some(_), Some(_)) => {
+            panic!("snapshot_anchor and delta_anchor are mutually exclusive")
+        }
+        (Some(anchor), None) => Some(HeaderAnchorBytes::Snapshot(anchor)),
+        (None, Some(anchor)) => Some(HeaderAnchorBytes::Delta(anchor)),
+        (None, None) => None,
     }
+}
+
+fn cuckoo_magic(legacy_magic: u64, anchor: Option<&HeaderAnchorBytes>) -> u64 {
+    anchor.map_or(legacy_magic, |anchor| anchor.magic(legacy_magic))
 }
 
 fn write_index_entry<W: Write>(
@@ -2543,7 +3055,8 @@ fn write_onion_index_meta(
     options: &OnionIndexCuckooOptions,
 ) -> Result<(), PipelineError> {
     let mut writer = BufWriter::new(File::create_new(path)?);
-    let magic = cuckoo_magic(ONION_INDEX_META_MAGIC, options.snapshot_anchor.is_some());
+    let anchor = header_anchor(options.snapshot_anchor, options.delta_anchor);
+    let magic = cuckoo_magic(ONION_INDEX_META_MAGIC, anchor.as_ref());
     writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(INDEX_K as u32).to_le_bytes())?;
     writer.write_all(&(ONION_INDEX_CUCKOO_HASHES as u32).to_le_bytes())?;
@@ -2552,8 +3065,8 @@ fn write_onion_index_meta(
     writer.write_all(&options.master_seed.to_le_bytes())?;
     writer.write_all(&options.tag_seed.to_le_bytes())?;
     writer.write_all(&(ONION_INDEX_SLOT_SIZE as u32).to_le_bytes())?;
-    if let Some(anchor) = options.snapshot_anchor {
-        writer.write_all(&anchor)?;
+    if let Some(anchor) = anchor {
+        anchor.write_to(&mut writer)?;
     }
     writer.flush()?;
     Ok(())
@@ -2641,7 +3154,8 @@ fn write_onion_data_cuckoo_file(
     options: &OnionDataCuckooOptions,
 ) -> Result<(), PipelineError> {
     let mut writer = BufWriter::with_capacity(1024 * 1024, File::create_new(path)?);
-    let magic = cuckoo_magic(ONION_DATA_CUCKOO_MAGIC, options.snapshot_anchor.is_some());
+    let anchor = header_anchor(options.snapshot_anchor, options.delta_anchor);
+    let magic = cuckoo_magic(ONION_DATA_CUCKOO_MAGIC, anchor.as_ref());
     writer.write_all(&magic.to_le_bytes())?;
     writer.write_all(&(CHUNK_K as u32).to_le_bytes())?;
     writer.write_all(&(ONION_DATA_CUCKOO_HASHES as u32).to_le_bytes())?;
@@ -2649,8 +3163,8 @@ fn write_onion_data_cuckoo_file(
     writer.write_all(&options.master_seed.to_le_bytes())?;
     writer.write_all(&(packed_entries as u32).to_le_bytes())?;
     writer.write_all(&[0u8; 4])?;
-    if let Some(anchor) = options.snapshot_anchor {
-        writer.write_all(&anchor)?;
+    if let Some(anchor) = anchor {
+        anchor.write_to(&mut writer)?;
     }
 
     for table in tables {
@@ -3003,6 +3517,104 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+fn write_varint_to_writer<W: Write>(writer: &mut W, mut value: u64) -> Result<(), PipelineError> {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        writer.write_all(&[byte])?;
+        if value == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn read_delta_u32(data: &[u8], pos: &mut usize, path: &Path) -> Result<u32, PipelineError> {
+    let bytes = take_delta_bytes(data, pos, 4, path, "u32")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn read_delta_varint(data: &[u8], pos: &mut usize, path: &Path) -> Result<u64, PipelineError> {
+    let mut shift = 0u32;
+    let mut value = 0u64;
+    for _ in 0..10 {
+        if *pos >= data.len() {
+            return Err(PipelineError::InvalidDeltaFormat {
+                path: path.to_path_buf(),
+                reason: "truncated varint".to_owned(),
+            });
+        }
+        let byte = data[*pos];
+        *pos += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    Err(PipelineError::InvalidDeltaFormat {
+        path: path.to_path_buf(),
+        reason: "varint exceeds 10 bytes".to_owned(),
+    })
+}
+
+fn take_delta_bytes<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+    path: &Path,
+    label: &str,
+) -> Result<&'a [u8], PipelineError> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| PipelineError::InvalidDeltaFormat {
+            path: path.to_path_buf(),
+            reason: format!("{label} offset overflow"),
+        })?;
+    if end > data.len() {
+        return Err(PipelineError::InvalidDeltaFormat {
+            path: path.to_path_buf(),
+            reason: format!("truncated {label}: need {len} bytes at offset {}", *pos),
+        });
+    }
+    let out = &data[*pos..end];
+    *pos = end;
+    Ok(out)
+}
+
+fn read_delta_group_body<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    path: &Path,
+) -> Result<([u8; SCRIPT_HASH_SIZE], &'a [u8]), PipelineError> {
+    let mut script_hash = [0u8; SCRIPT_HASH_SIZE];
+    script_hash.copy_from_slice(take_delta_bytes(
+        data,
+        pos,
+        SCRIPT_HASH_SIZE,
+        path,
+        "script hash",
+    )?);
+    let body_start = *pos;
+
+    let spent = read_delta_varint(data, pos, path)?;
+    for _ in 0..spent {
+        take_delta_bytes(data, pos, TXID_SIZE, path, "spent txid")?;
+        read_delta_varint(data, pos, path)?;
+    }
+
+    let new_utxos = read_delta_varint(data, pos, path)?;
+    for _ in 0..new_utxos {
+        take_delta_bytes(data, pos, TXID_SIZE, path, "new txid")?;
+        read_delta_varint(data, pos, path)?;
+        read_delta_varint(data, pos, path)?;
+    }
+
+    Ok((script_hash, &data[body_start..*pos]))
+}
+
 struct FlatEntryIter {
     reader: BufReader<File>,
     buf: [u8; FLAT_UTXO_ENTRY_SIZE],
@@ -3061,6 +3673,138 @@ mod tests {
             out,
             [0x00, 0x01, 0x7f, 0x80, 0x01, 0xff, 0x01, 0x80, 0x80, 0x01]
         );
+    }
+
+    #[test]
+    fn delta_from_flat_sets_is_deterministic_and_packs_legacy_format() {
+        let dir = fresh_temp_dir("delta-flat");
+        let from1 = dir.join("from1.bin");
+        let to1 = dir.join("to1.bin");
+        let from2 = dir.join("from2.bin");
+        let to2 = dir.join("to2.bin");
+
+        let sh1 = [1u8; SCRIPT_HASH_SIZE];
+        let sh2 = [2u8; SCRIPT_HASH_SIZE];
+        let sh3 = [3u8; SCRIPT_HASH_SIZE];
+        let sh4 = [4u8; SCRIPT_HASH_SIZE];
+        let sh5 = [5u8; SCRIPT_HASH_SIZE];
+        let tx1 = [0x11u8; TXID_SIZE];
+        let tx2 = [0x22u8; TXID_SIZE];
+        let tx3 = [0x33u8; TXID_SIZE];
+        let tx4 = [0x44u8; TXID_SIZE];
+        let tx5 = [0x55u8; TXID_SIZE];
+
+        write_flat_entries(
+            &from1,
+            &[
+                (sh1, tx1, 0, 1_000, 10),
+                (sh2, tx2, 1, 2_000, 11),
+                (sh3, tx3, 2, 100, 12),
+            ],
+        );
+        write_flat_entries(
+            &to1,
+            &[
+                (sh1, tx1, 0, 1_000, 10),
+                (sh4, tx4, 3, 3_000, 20),
+                (sh5, tx5, 4, 100, 21),
+            ],
+        );
+        write_flat_entries(
+            &from2,
+            &[
+                (sh3, tx3, 2, 100, 12),
+                (sh1, tx1, 0, 1_000, 10),
+                (sh2, tx2, 1, 2_000, 11),
+            ],
+        );
+        write_flat_entries(
+            &to2,
+            &[
+                (sh5, tx5, 4, 100, 21),
+                (sh4, tx4, 3, 3_000, 20),
+                (sh1, tx1, 0, 1_000, 10),
+            ],
+        );
+
+        let grouped1 = dir.join("delta1.bin");
+        let grouped2 = dir.join("delta2.bin");
+        let report1 = build_grouped_delta_from_flat_sets(
+            &from1,
+            &to1,
+            &grouped1,
+            &DeltaBuildOptions::default(),
+        )
+        .expect("build delta 1");
+        let report2 = build_grouped_delta_from_flat_sets(
+            &from2,
+            &to2,
+            &grouped2,
+            &DeltaBuildOptions::default(),
+        )
+        .expect("build delta 2");
+        assert_eq!(
+            report1,
+            DeltaBuildReport {
+                from_entries: 3,
+                to_entries: 3,
+                unchanged_entries: 1,
+                spent_entries: 2,
+                created_entries: 1,
+                dust_created_skipped: 1,
+                scripts_changed: 3,
+                grouped_file_bytes: 171,
+            }
+        );
+        assert_eq!(report2, report1);
+        assert_eq!(
+            std::fs::read(&grouped1).unwrap(),
+            std::fs::read(&grouped2).unwrap()
+        );
+
+        let chunks = dir.join("delta_chunks.bin");
+        let index = dir.join("delta_index.bin");
+        let chunk_report = build_delta_chunks(&grouped1, &chunks, &index).expect("delta chunks");
+        assert_eq!(
+            chunk_report,
+            DeltaChunkBuildReport {
+                scripts: 3,
+                chunks_written: 3,
+                index_entries: 3,
+                skipped_too_large: 0,
+                chunks_file_bytes: 120,
+                index_file_bytes: 75,
+                data_bytes: 107,
+                padding_bytes: 13,
+            }
+        );
+
+        let onion_dir = dir.join("onion");
+        let onion_report = build_delta_onion_pack(
+            &grouped1,
+            &onion_dir,
+            &OnionPackOptions {
+                entry_size: 64,
+                ..Default::default()
+            },
+        )
+        .expect("delta onion pack");
+        assert_eq!(
+            onion_report,
+            DeltaOnionPackReport {
+                scripts: 3,
+                groups_packed: 3,
+                whale_spks_excluded: 0,
+                onion_entries: 3,
+                packed_file_bytes: 192,
+                index_file_bytes: 81,
+                data_bytes: 107,
+                padding_bytes: 85,
+                max_serialized_len: 37,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3483,6 +4227,7 @@ mod tests {
                 master_seed: 0xf5c3_6b45_6159_d686,
                 tag_seed: 0x0c65_b3f4_e239_2919,
                 snapshot_anchor: Some(regtest_anchor),
+                delta_anchor: None,
             },
         )
         .expect("build anchored index cuckoo");
@@ -3550,6 +4295,7 @@ mod tests {
             &ChunkCuckooOptions {
                 master_seed: 0x875a_2299_804a_46fc,
                 snapshot_anchor: Some(regtest_anchor),
+                delta_anchor: None,
             },
         )
         .expect("build chunk cuckoo with regtest anchor-derived seed");
@@ -3670,5 +4416,20 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         dir
+    }
+
+    fn write_flat_entries(
+        path: &Path,
+        entries: &[([u8; SCRIPT_HASH_SIZE], [u8; TXID_SIZE], u32, u64, u32)],
+    ) {
+        let mut out = Vec::with_capacity(entries.len() * FLAT_UTXO_ENTRY_SIZE);
+        for (script_hash, txid, vout, amount, height) in entries {
+            out.extend_from_slice(script_hash);
+            out.extend_from_slice(txid);
+            out.extend_from_slice(&vout.to_le_bytes());
+            out.extend_from_slice(&amount.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+        }
+        std::fs::write(path, out).unwrap();
     }
 }

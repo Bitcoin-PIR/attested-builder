@@ -144,6 +144,12 @@ pub struct FlatUtxoReport {
     pub flat_utxo_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanProgress {
+    pub coins: u64,
+    pub total_coins: u64,
+}
+
 pub struct SnapshotReader<R> {
     reader: R,
     header: SnapshotHeader,
@@ -270,11 +276,22 @@ impl<R: Read> SnapshotReader<R> {
 }
 
 pub fn compute_muhash(path: impl AsRef<Path>) -> Result<MuhashReport, SnapshotError> {
+    compute_muhash_with_progress(path, 0, |_| {})
+}
+
+pub fn compute_muhash_with_progress(
+    path: impl AsRef<Path>,
+    progress_interval: u64,
+    mut progress: impl FnMut(ScanProgress),
+) -> Result<MuhashReport, SnapshotError> {
     let mut snapshot = SnapshotReader::open(path)?;
     let header = snapshot.header().clone();
     let mut muhash = MuHash3072::new();
+    let mut coins = 0u64;
     while let Some(coin) = snapshot.next_coin()? {
         muhash.insert(&coin.muhash_preimage());
+        coins += 1;
+        report_progress(coins, header.coin_count, progress_interval, &mut progress);
     }
     snapshot.finish()?;
     Ok(MuhashReport {
@@ -288,8 +305,17 @@ pub fn verify_muhash(
     path: impl AsRef<Path>,
     expected_display_hex: &str,
 ) -> Result<MuhashReport, SnapshotError> {
+    verify_muhash_with_progress(path, expected_display_hex, 0, |_| {})
+}
+
+pub fn verify_muhash_with_progress(
+    path: impl AsRef<Path>,
+    expected_display_hex: &str,
+    progress_interval: u64,
+    progress: impl FnMut(ScanProgress),
+) -> Result<MuhashReport, SnapshotError> {
     validate_expected_muhash(expected_display_hex)?;
-    let report = compute_muhash(path)?;
+    let report = compute_muhash_with_progress(path, progress_interval, progress)?;
     if !report
         .muhash_display_hex
         .eq_ignore_ascii_case(expected_display_hex)
@@ -314,6 +340,22 @@ pub fn materialize_flat_utxo_set(
     snapshot_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     expected_display_hex: &str,
+) -> Result<FlatUtxoReport, SnapshotError> {
+    materialize_flat_utxo_set_with_progress(
+        snapshot_path,
+        output_path,
+        expected_display_hex,
+        0,
+        |_| {},
+    )
+}
+
+pub fn materialize_flat_utxo_set_with_progress(
+    snapshot_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    expected_display_hex: &str,
+    progress_interval: u64,
+    mut progress: impl FnMut(ScanProgress),
 ) -> Result<FlatUtxoReport, SnapshotError> {
     validate_expected_muhash(expected_display_hex)?;
 
@@ -340,7 +382,13 @@ pub fn materialize_flat_utxo_set(
         return Err(SnapshotError::OutputExists(tmp_path.display().to_string()));
     }
 
-    let result = materialize_flat_utxo_set_inner(snapshot_path, &tmp_path, expected_display_hex);
+    let result = materialize_flat_utxo_set_inner(
+        snapshot_path,
+        &tmp_path,
+        expected_display_hex,
+        progress_interval,
+        &mut progress,
+    );
     match result {
         Ok(report) => {
             std::fs::rename(&tmp_path, output_path)?;
@@ -357,6 +405,8 @@ fn materialize_flat_utxo_set_inner(
     snapshot_path: impl AsRef<Path>,
     tmp_path: &Path,
     expected_display_hex: &str,
+    progress_interval: u64,
+    progress: &mut impl FnMut(ScanProgress),
 ) -> Result<FlatUtxoReport, SnapshotError> {
     let mut snapshot = SnapshotReader::open(snapshot_path)?;
     let header = snapshot.header().clone();
@@ -368,6 +418,7 @@ fn materialize_flat_utxo_set_inner(
         muhash.insert(&coin.muhash_preimage());
         write_flat_utxo_entry(&mut writer, &coin)?;
         coins += 1;
+        report_progress(coins, header.coin_count, progress_interval, progress);
     }
     snapshot.finish()?;
     writer.flush()?;
@@ -386,6 +437,20 @@ fn materialize_flat_utxo_set_inner(
         muhash_display_hex: actual,
         flat_utxo_bytes: coins * FLAT_UTXO_ENTRY_SIZE,
     })
+}
+
+fn report_progress(
+    coins: u64,
+    total_coins: u64,
+    progress_interval: u64,
+    progress: &mut impl FnMut(ScanProgress),
+) {
+    if progress_interval == 0 {
+        return;
+    }
+    if coins == total_coins || coins % progress_interval == 0 {
+        progress(ScanProgress { coins, total_coins });
+    }
 }
 
 pub fn write_chain_anchor(
