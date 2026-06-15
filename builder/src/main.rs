@@ -2,6 +2,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
+mod evidence;
 mod receipt;
 mod root_payload;
 mod signer;
@@ -48,6 +49,24 @@ fn main() -> ExitCode {
         }
         Some("write-build-receipt") if args.len() == 6 => {
             receipt::write_build_receipt(&args[2], &args[3], &args[4], &args[5])
+        }
+        Some("write-build-evidence") if args.len() == 10 => evidence::write_build_evidence(
+            &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
+        ),
+        Some("inspect-build-evidence") if args.len() == 3 => {
+            evidence::inspect_build_evidence(&args[2])
+        }
+        Some("verify-build-evidence") if args.len() >= 3 => {
+            evidence::verify_build_evidence(&args[2], &args[3..])
+        }
+        Some("write-tee-report-data") if args.len() == 4 => {
+            evidence::write_tee_report_data(&args[2], &args[3])
+        }
+        Some("verify-tee-report-data") if args.len() == 4 => {
+            evidence::verify_tee_report_data(&args[2], &args[3])
+        }
+        Some("emit-sev-snp-quote") if args.len() == 4 || args.len() == 5 => {
+            evidence::emit_sev_snp_quote(&args[2], &args[3], args.get(4))
         }
         Some("generate-builder-key") if args.len() == 3 => signer::generate_builder_key(&args[2]),
         Some("sign-root-bundle") if args.len() == 5 => {
@@ -139,6 +158,12 @@ fn usage(bin: &str) {
   {bin} build-bucket-merkle <batch_pir_cuckoo.bin> <chunk_pir_cuckoo.bin> <out-dir>\n\
   {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} write-build-receipt <signed-root-bundle.bin> <snapshot.dat> <core-version> <out-receipt.txt>\n\
+  {bin} write-build-evidence <out-dir> <snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
+  {bin} inspect-build-evidence <build-evidence.bin>\n\
+  {bin} verify-build-evidence <build-evidence.bin> [--snapshot <snapshot.dat>] [--builder-bin <path>] [--payload <root-bundle-payload.bin>] [--database-manifest <path>] [--all-artifacts-manifest <path>] [--server-db-manifest <path>] [--expected-muhash <hex>] [--expected-anchor-height <height>] [--expected-anchor-hash <hex>] [--expected-report-data <64-byte-hex>] [--sev-snp-report <report.bin>]\n\
+  {bin} write-tee-report-data <build-evidence.bin> <out-report-data.bin>\n\
+  {bin} verify-tee-report-data <build-evidence.bin> <report-data-hex-or-file>\n\
+  {bin} emit-sev-snp-quote <build-evidence.bin> <out-sev-snp-report.bin> [out-report-data.bin]\n\
   {bin} generate-builder-key <out-builder-key.txt>\n\
   {bin} sign-root-bundle <payload.bin> <builder-key.txt> <out-signed-root-bundle.bin>\n\
   {bin} verify-root-bundle <signed-root-bundle.bin> <threshold> <trusted-pubkey-hex> [trusted-pubkey-hex...]\n\

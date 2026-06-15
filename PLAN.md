@@ -111,6 +111,17 @@ enclave-resident with pinned PCRs; browsers never parse them.
   bundle and later TEE quote. The signer module keeps this as a narrow
   provider boundary so an SEV/TDX/Nitro resident key can later replace
   the local key file without changing the bundle format.
+- `write-build-evidence` emits the byte-stable builder-attestation
+  payload for a completed output directory. It records the source
+  snapshot hash/size, Core version, builder commit/binary hash, optional
+  TEE platform measurement, anchor/MuHash/layout, root-bundle payload
+  hash, reproducibility manifest hashes, and `server-db/MANIFEST.toml`
+  hash. `write-tee-report-data` derives the 64-byte value that a TEE
+  quote must bind; `verify-build-evidence` re-checks the evidence against
+  local files/expected anchor values and can compare that value against a
+  raw SEV-SNP report's `REPORT_DATA`. `emit-sev-snp-quote` is the first
+  concrete quote provider: inside an SEV-SNP guest with `/dev/sev-guest`,
+  it asks the kernel for a report over that exact report-data value.
 - `scripts/build-snapshot-database.sh` — the host/TEE orchestration
   entrypoint for a real snapshot: one MuHash-verifying materialization
   pass, deterministic DPF/Harmony and Onion database stages, optional
@@ -122,7 +133,10 @@ enclave-resident with pinned PCRs; browsers never parse them.
   contributes a non-zero `manifest_roots` attestation commitment. The
   `stage-server-db <out-dir> [server-db-dir]` subcommand can add the same
   staging directory to an existing build output without re-running the
-  snapshot pipeline. `scripts/local-mainnet-build.sh` binds this to the
+  snapshot pipeline. Full builds now also write `build-evidence.bin` and
+  `build-evidence.report-data` by default; setting `EMIT_SEV_SNP_QUOTE=1`
+  additionally writes `build-evidence.sev-snp-report.bin` on a real
+  SEV-SNP guest. `scripts/local-mainnet-build.sh` binds this to the
   owner's height-953383 mainnet snapshot and writes only to fresh
   timestamped directories under `/Volumes/Bitcoin`.
 

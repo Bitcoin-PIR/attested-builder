@@ -29,6 +29,15 @@
 #   STAGE_SERVER_DB   1 to hardlink/copy server-loadable files to server-db/
 #                     and write server-db/MANIFEST.toml. Default 1.
 #   SERVER_DB_DIR     Optional server DB staging dir. Default OUT_DIR/server-db.
+#   WRITE_BUILD_EVIDENCE 1 to write canonical build-evidence.bin and
+#                     build-evidence.report-data. Default 1.
+#   BUILDER_GIT_COMMIT   Builder source revision to record. Default current git
+#                     HEAD with "-dirty" suffix if tracked files differ.
+#   TEE_PLATFORM      Evidence-only platform label, e.g. none, sev-snp, tdx.
+#                     Default none.
+#   TEE_IMAGE_MEASUREMENT Hex measurement bytes, or none. Default none.
+#   EMIT_SEV_SNP_QUOTE 1 to call /dev/sev-guest and write
+#                     build-evidence.sev-snp-report.bin. Default 0.
 #
 # Subcommands:
 #   stage-server-db <out-dir> [server-db-dir]
@@ -41,7 +50,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 usage() {
-    sed -n '1,39p' "$0" >&2
+    sed -n '1,47p' "$0" >&2
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -84,6 +93,18 @@ is_truthy() {
         1|true|TRUE|yes|YES|y|Y) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+current_git_commit() {
+    local rev
+    rev=$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || printf unknown)
+    if [[ "$rev" != "unknown" ]] &&
+        { ! git -C "$REPO_ROOT" diff --quiet -- 2>/dev/null ||
+          ! git -C "$REPO_ROOT" diff --cached --quiet -- 2>/dev/null; }; then
+        printf '%s-dirty\n' "$rev"
+    else
+        printf '%s\n' "$rev"
+    fi
 }
 
 ensure_empty_or_absent_dir() {
@@ -335,6 +356,11 @@ SKIP_CARGO_BUILD=${SKIP_CARGO_BUILD:-0}
 WRITE_RECEIPT=${WRITE_RECEIPT:-auto}
 PUSH_BATCH_ENTRIES=${PUSH_BATCH_ENTRIES:-256}
 STAGE_SERVER_DB=${STAGE_SERVER_DB:-1}
+WRITE_BUILD_EVIDENCE=${WRITE_BUILD_EVIDENCE:-1}
+BUILDER_GIT_COMMIT=${BUILDER_GIT_COMMIT:-$(current_git_commit)}
+TEE_PLATFORM=${TEE_PLATFORM:-none}
+TEE_IMAGE_MEASUREMENT=${TEE_IMAGE_MEASUREMENT:-none}
+EMIT_SEV_SNP_QUOTE=${EMIT_SEV_SNP_QUOTE:-0}
 OUT_DIR=${OUT_DIR:-"/tmp/attested-builder-snapshot-$(date -u +%Y%m%dT%H%M%SZ)"}
 SERVER_DB_DIR=${SERVER_DB_DIR:-"$OUT_DIR/server-db"}
 
@@ -360,6 +386,9 @@ ENV_FILE="$OUT_DIR/build.env"
     printf 'partitions=%s\n' "$PARTITIONS"
     printf 'issued_at=%s\n' "$ISSUED_AT"
     printf 'run_onion_ffi=%s\n' "$RUN_ONION_FFI"
+    printf 'builder_git_commit=%s\n' "$BUILDER_GIT_COMMIT"
+    printf 'tee_platform=%s\n' "$TEE_PLATFORM"
+    printf 'tee_image_measurement=%s\n' "$TEE_IMAGE_MEASUREMENT"
 } > "$ENV_FILE"
 cp "$ENV_FILE" "$SUMMARY"
 
@@ -539,9 +568,49 @@ diff_manifest_if_requested \
     "$ALL_ARTIFACTS_MANIFEST" \
     "$OUT_DIR/all-artifacts.manifest.diff"
 
+if is_truthy "$WRITE_BUILD_EVIDENCE"; then
+    run_step 15-write-build-evidence \
+        "$BIN" write-build-evidence \
+        "$OUT_DIR" \
+        "$SNAPSHOT" \
+        "$CORE_VERSION" \
+        "$BUILDER_GIT_COMMIT" \
+        "$BIN" \
+        "$TEE_PLATFORM" \
+        "$TEE_IMAGE_MEASUREMENT" \
+        "$OUT_DIR/build-evidence.bin"
+
+    run_step 16-write-tee-report-data \
+        "$BIN" write-tee-report-data \
+        "$OUT_DIR/build-evidence.bin" \
+        "$OUT_DIR/build-evidence.report-data"
+
+    if is_truthy "$EMIT_SEV_SNP_QUOTE"; then
+        run_step 17-emit-sev-snp-quote \
+            "$BIN" emit-sev-snp-quote \
+            "$OUT_DIR/build-evidence.bin" \
+            "$OUT_DIR/build-evidence.sev-snp-report.bin" \
+            "$OUT_DIR/build-evidence.report-data"
+    fi
+fi
+
 bucket_root=$(kv "$LOG_DIR/05-build-bucket-merkle.out" "super_root")
 onion_root=$(kv "$LOG_DIR/09-build-onion-merkle.out" "super_root")
 payload_sha256=$(kv "$LOG_DIR/11-build-root-bundle-payload.out" "payload_sha256")
+evidence_file_sha256=
+evidence_digest=
+report_data=
+sev_snp_report_sha256=
+if [[ -f "$LOG_DIR/15-write-build-evidence.out" ]]; then
+    evidence_file_sha256=$(kv "$LOG_DIR/15-write-build-evidence.out" "evidence_file_sha256")
+    evidence_digest=$(kv "$LOG_DIR/15-write-build-evidence.out" "evidence_digest")
+fi
+if [[ -f "$LOG_DIR/16-write-tee-report-data.out" ]]; then
+    report_data=$(kv "$LOG_DIR/16-write-tee-report-data.out" "report_data")
+fi
+if [[ -f "$LOG_DIR/17-emit-sev-snp-quote.out" ]]; then
+    sev_snp_report_sha256=$(kv "$LOG_DIR/17-emit-sev-snp-quote.out" "sev_snp_report_sha256")
+fi
 
 {
     printf 'status=ok\n'
@@ -553,6 +622,18 @@ payload_sha256=$(kv "$LOG_DIR/11-build-root-bundle-payload.out" "payload_sha256"
     printf 'bucket_super_root=%s\n' "$bucket_root"
     printf 'onion_super_root=%s\n' "$onion_root"
     printf 'payload_sha256=%s\n' "$payload_sha256"
+    if [[ -n "$evidence_digest" ]]; then
+        printf 'build_evidence=%s\n' "$OUT_DIR/build-evidence.bin"
+        printf 'build_evidence_file_sha256=%s\n' "$evidence_file_sha256"
+        printf 'build_evidence_digest=%s\n' "$evidence_digest"
+    fi
+    if [[ -n "$report_data" ]]; then
+        printf 'build_evidence_report_data=%s\n' "$report_data"
+    fi
+    if [[ -n "$sev_snp_report_sha256" ]]; then
+        printf 'build_evidence_sev_snp_report=%s\n' "$OUT_DIR/build-evidence.sev-snp-report.bin"
+        printf 'build_evidence_sev_snp_report_sha256=%s\n' "$sev_snp_report_sha256"
+    fi
     if [[ -f "$OUT_DIR/signed-root-bundle.bin" ]]; then
         printf 'bundle_sha256=%s\n' "$(hash_one "$OUT_DIR/signed-root-bundle.bin")"
     fi

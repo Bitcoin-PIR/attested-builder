@@ -322,6 +322,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom",
  "hex",
+ "libc",
  "rootbundle",
  "sha2",
  "utxosnapshot",
