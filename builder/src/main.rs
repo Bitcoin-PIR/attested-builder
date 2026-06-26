@@ -984,3 +984,241 @@ fn params_hash(index_bins: &str, chunk_bins: &str, onion_entry_size: &str) -> Ex
     println!("params_hash={}", hex::encode(params.params_hash()));
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_optional_anchor_returns_none_when_no_extra_args() {
+        let argv = args(&["pir-attested-builder", "build-index-cuckoo", "in.bin", "out.bin"]);
+        assert!(matches!(
+            parse_optional_anchor(&argv, 4),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn parse_optional_anchor_accepts_anchor_value() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-index-cuckoo",
+            "in.bin",
+            "out.bin",
+            "--anchor",
+            "anchor.bin",
+        ]);
+        match parse_optional_anchor(&argv, 4) {
+            Ok(Some(path)) => assert_eq!(path, "anchor.bin"),
+            other => panic!("expected Ok(Some(\"anchor.bin\")), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_optional_anchor_rejects_malformed_extra_args() {
+        // `--anchor` without a value
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-index-cuckoo",
+            "in.bin",
+            "out.bin",
+            "--anchor",
+        ]);
+        assert_eq!(parse_optional_anchor(&argv, 4), Err(ExitCode::from(2)));
+
+        // trailing positional arg without `--anchor` flag
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-index-cuckoo",
+            "in.bin",
+            "out.bin",
+            "unexpected.bin",
+        ]);
+        assert_eq!(parse_optional_anchor(&argv, 4), Err(ExitCode::from(2)));
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_uses_defaults_for_empty_args() {
+        let argv = args(&[]);
+        let (size, root_only) =
+            parse_entry_size_and_root_only(&argv, 3_328).expect("empty args should parse");
+        assert_eq!(size, 3_328);
+        assert!(!root_only);
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_accepts_entry_size_alone() {
+        let argv = args(&["42"]);
+        let (size, root_only) =
+            parse_entry_size_and_root_only(&argv, 3_328).expect("entry-size only should parse");
+        assert_eq!(size, 42);
+        assert!(!root_only);
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_accepts_root_only_alone() {
+        let argv = args(&["--root-only"]);
+        let (size, root_only) =
+            parse_entry_size_and_root_only(&argv, 3_328).expect("--root-only should parse");
+        assert_eq!(size, 3_328);
+        assert!(root_only);
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_accepts_entry_size_then_root_only() {
+        let argv = args(&["42", "--root-only"]);
+        let (size, root_only) =
+            parse_entry_size_and_root_only(&argv, 3_328).expect("entry-size+root-only should parse");
+        assert_eq!(size, 42);
+        assert!(root_only);
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_rejects_zero_entry_size() {
+        let argv = args(&["0"]);
+        assert_eq!(
+            parse_entry_size_and_root_only(&argv, 3_328),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_rejects_out_of_range_entry_size() {
+        let argv = args(&["65536"]);
+        assert_eq!(
+            parse_entry_size_and_root_only(&argv, 3_328),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_rejects_non_integer_entry_size() {
+        let argv = args(&["not-a-number"]);
+        assert_eq!(
+            parse_entry_size_and_root_only(&argv, 3_328),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_entry_size_and_root_only_rejects_extra_positional_after_entry_size() {
+        let argv = args(&["42", "extra"]);
+        assert_eq!(
+            parse_entry_size_and_root_only(&argv, 3_328),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_uses_defaults_for_empty_tail() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+        ]);
+        let (size, anchor) =
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE)
+                .expect("empty tail should parse");
+        assert_eq!(size, dbpipeline::DEFAULT_ONION_ENTRY_SIZE);
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_accepts_anchor_only() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+            "--anchor",
+            "anchor.bin",
+        ]);
+        let (size, anchor) =
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE)
+                .expect("anchor-only should parse");
+        assert_eq!(size, dbpipeline::DEFAULT_ONION_ENTRY_SIZE);
+        assert_eq!(anchor, Some("anchor.bin"));
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_accepts_entry_size_and_anchor() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+            "42",
+            "--anchor",
+            "anchor.bin",
+        ]);
+        let (size, anchor) =
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE)
+                .expect("entry-size+anchor should parse");
+        assert_eq!(size, 42);
+        assert_eq!(anchor, Some("anchor.bin"));
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_rejects_invalid_entry_size() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+            "not-a-number",
+        ]);
+        assert_eq!(
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_rejects_dangling_anchor_flag() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+            "--anchor",
+        ]);
+        assert_eq!(
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn parse_onion_entry_size_and_anchor_rejects_trailing_positional_without_flag() {
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-onion-data-cuckoo",
+            "in.bin",
+            "out-dir",
+            "42",
+            "extra",
+        ]);
+        assert_eq!(
+            parse_onion_entry_size_and_anchor(&argv, dbpipeline::DEFAULT_ONION_ENTRY_SIZE),
+            Err(ExitCode::from(2))
+        );
+    }
+
+    #[test]
+    fn display_hash_hex_reverses_and_encodes() {
+        let mut internal = [0u8; 32];
+        for (i, b) in internal.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // After reversal, the first output byte is the original last byte (0x1f).
+        assert_eq!(
+            display_hash_hex(&internal),
+            "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+        );
+    }
+}

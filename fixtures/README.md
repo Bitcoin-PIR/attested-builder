@@ -13,7 +13,7 @@ macOS, Homebrew; `dumptxoutset` v2 snapshot format, Core ≥ 28).
 
 ## 1. Regtest golden fixture (committed here)
 
-File: [`txoutset_regtest_111.dat`](txoutset_regtest_111.dat) (6,861 bytes,
+File: `txoutset_regtest_111.dat` (in-repo path: `./fixtures/txoutset_regtest_111.dat`,
 committed — this is the end-to-end test input).
 
 | field | value |
