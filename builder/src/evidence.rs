@@ -7,9 +7,12 @@ use std::process::ExitCode;
 
 use sha2::{Digest, Sha256};
 
-const EVIDENCE_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/v1\0";
-const REPORT_DATA_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/report-data/v1\0";
-const EVIDENCE_VERSION: u16 = 1;
+const EVIDENCE_V1_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/v1\0";
+const EVIDENCE_V2_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/v2\0";
+const REPORT_DATA_V1_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/report-data/v1\0";
+const REPORT_DATA_V2_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-evidence/report-data/v2\0";
+const EVIDENCE_VERSION_V1: u16 = 1;
+const EVIDENCE_VERSION_V2: u16 = 2;
 const MAX_STRING_LEN: usize = 4096;
 const MAX_MEASUREMENT_LEN: usize = 4096;
 const SEV_SNP_REPORT_DATA_OFFSET: usize = 0x50;
@@ -18,6 +21,7 @@ const SEV_SNP_REPORT_LEN: usize = 1184;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BuildEvidence {
+    version: u16,
     builder_git_commit: String,
     builder_binary_sha256: [u8; 32],
     tee_platform: String,
@@ -43,6 +47,16 @@ struct BuildEvidence {
     database_manifest_sha256: [u8; 32],
     all_artifacts_manifest_sha256: [u8; 32],
     server_db_manifest_sha256: [u8; 32],
+    evidence_mode: u8,
+    predecessor_evidence_sha256: Option<[u8; 32]>,
+    onion_layout_v2: Option<OnionLayoutV2>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OnionLayoutV2 {
+    total_packed_entries: u32,
+    index_bins_per_table: u32,
+    chunk_bins_per_table: u32,
 }
 
 impl BuildEvidence {
@@ -58,7 +72,10 @@ impl BuildEvidence {
         }
 
         let mut out = Vec::with_capacity(512 + self.tee_image_measurement.len());
-        put_u16(&mut out, EVIDENCE_VERSION);
+        if self.version != EVIDENCE_VERSION_V1 && self.version != EVIDENCE_VERSION_V2 {
+            return Err(format!("unsupported evidence version: {}", self.version));
+        }
+        put_u16(&mut out, self.version);
         put_string(&mut out, &self.builder_git_commit)?;
         put_arr(&mut out, &self.builder_binary_sha256);
         put_string(&mut out, &self.tee_platform)?;
@@ -90,13 +107,29 @@ impl BuildEvidence {
         put_arr(&mut out, &self.database_manifest_sha256);
         put_arr(&mut out, &self.all_artifacts_manifest_sha256);
         put_arr(&mut out, &self.server_db_manifest_sha256);
+        if self.version == EVIDENCE_VERSION_V2 {
+            let layout = self
+                .onion_layout_v2
+                .ok_or("v2 evidence missing Onion layout")?;
+            out.push(self.evidence_mode);
+            match self.predecessor_evidence_sha256 {
+                Some(hash) => {
+                    out.push(1);
+                    put_arr(&mut out, &hash);
+                }
+                None => out.push(0),
+            }
+            put_u32(&mut out, layout.total_packed_entries);
+            put_u32(&mut out, layout.index_bins_per_table);
+            put_u32(&mut out, layout.chunk_bins_per_table);
+        }
         Ok(out)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         let cur = &mut &bytes[..];
         let version = take_u16(cur, "version")?;
-        if version != EVIDENCE_VERSION {
+        if version != EVIDENCE_VERSION_V1 && version != EVIDENCE_VERSION_V2 {
             return Err(format!("unsupported evidence version: {version}"));
         }
         let builder_git_commit = take_string(cur, "builder_git_commit")?;
@@ -128,10 +161,34 @@ impl BuildEvidence {
         let database_manifest_sha256 = take_arr::<32>(cur, "database_manifest_sha256")?;
         let all_artifacts_manifest_sha256 = take_arr::<32>(cur, "all_artifacts_manifest_sha256")?;
         let server_db_manifest_sha256 = take_arr::<32>(cur, "server_db_manifest_sha256")?;
+        let (evidence_mode, predecessor_evidence_sha256, onion_layout_v2) =
+            if version == EVIDENCE_VERSION_V2 {
+                let evidence_mode = take_u8(cur, "evidence_mode")?;
+                if evidence_mode > 1 {
+                    return Err(format!("unknown evidence mode: {evidence_mode}"));
+                }
+                let predecessor = match take_u8(cur, "has_predecessor_evidence")? {
+                    0 => None,
+                    1 => Some(take_arr::<32>(cur, "predecessor_evidence_sha256")?),
+                    _ => return Err("bad predecessor evidence option tag".into()),
+                };
+                let layout = OnionLayoutV2 {
+                    total_packed_entries: take_u32(cur, "onion_total_packed_entries")?,
+                    index_bins_per_table: take_u32(cur, "onion_index_bins_per_table")?,
+                    chunk_bins_per_table: take_u32(cur, "onion_chunk_bins_per_table")?,
+                };
+                if evidence_mode == 1 && predecessor.is_none() {
+                    return Err("reattest_existing evidence requires predecessor digest".into());
+                }
+                (evidence_mode, predecessor, Some(layout))
+            } else {
+                (0, None, None)
+            };
         if !cur.is_empty() {
             return Err("trailing bytes in build evidence".into());
         }
         let evidence = Self {
+            version,
             builder_git_commit,
             builder_binary_sha256,
             tee_platform,
@@ -157,6 +214,9 @@ impl BuildEvidence {
             database_manifest_sha256,
             all_artifacts_manifest_sha256,
             server_db_manifest_sha256,
+            evidence_mode,
+            predecessor_evidence_sha256,
+            onion_layout_v2,
         };
         validate_metadata_string("builder_git_commit", &evidence.builder_git_commit)?;
         validate_metadata_string("tee_platform", &evidence.tee_platform)?;
@@ -168,7 +228,7 @@ impl BuildEvidence {
     }
 
     fn evidence_digest(&self) -> Result<[u8; 32], String> {
-        evidence_digest(&self.encode()?)
+        evidence_digest(self.version, &self.encode()?)
     }
 
     fn evidence_file_sha256(&self) -> Result<[u8; 32], String> {
@@ -176,7 +236,7 @@ impl BuildEvidence {
     }
 
     fn report_data(&self) -> Result<[u8; 64], String> {
-        report_data_for_evidence_bytes(&self.encode()?)
+        report_data_for_evidence_bytes(self.version, &self.encode()?)
     }
 }
 
@@ -216,6 +276,7 @@ pub fn write_build_evidence(
             .root("merkle/onion/super_root")
             .ok_or("root-bundle payload missing merkle/onion/super_root")?;
         let evidence = BuildEvidence {
+            version: EVIDENCE_VERSION_V1,
             builder_git_commit: builder_git_commit.to_owned(),
             builder_binary_sha256,
             tee_platform: tee_platform.to_owned(),
@@ -244,6 +305,9 @@ pub fn write_build_evidence(
             database_manifest_sha256,
             all_artifacts_manifest_sha256,
             server_db_manifest_sha256,
+            evidence_mode: 0,
+            predecessor_evidence_sha256: None,
+            onion_layout_v2: None,
         };
         let evidence = evidence.with_layout_from_summary(out_dir)?;
         let encoded = evidence.encode()?;
@@ -269,6 +333,245 @@ pub fn write_build_evidence(
             ExitCode::from(1)
         }
     }
+}
+
+/// Re-seal a completed v1 artifact set as proof v2 without rebuilding the
+/// database. The checker scans the final Onion tables and Merkle material;
+/// only after those checks pass does it emit a new payload and evidence file.
+pub fn attest_existing_layout(
+    predecessor_proof_dir: &str,
+    artifact_dir: &str,
+    builder_git_commit: &str,
+    builder_binary: &str,
+    tee_platform: &str,
+    tee_image_measurement_hex_or_none: &str,
+    issued_at: &str,
+    out_dir: &str,
+) -> ExitCode {
+    let result = (|| {
+        let predecessor_dir = Path::new(predecessor_proof_dir);
+        let predecessor_path = predecessor_dir.join("build-evidence.bin");
+        let predecessor_bytes = fs::read(&predecessor_path)
+            .map_err(|e| format!("failed to read {}: {e}", predecessor_path.display()))?;
+        let predecessor = BuildEvidence::decode(&predecessor_bytes)?;
+        if predecessor.version != EVIDENCE_VERSION_V1 {
+            return Err(format!(
+                "predecessor evidence must be v1, got v{}",
+                predecessor.version
+            ));
+        }
+        verify_predecessor_proof_directory(predecessor_dir, &predecessor)?;
+
+        let layout = dbpipeline::inspect_existing_onion_layout_v2(artifact_dir)
+            .map_err(|e| format!("artifact consistency check failed: {e}"))?;
+        if layout.onion_super_root != predecessor.onion_super_root {
+            return Err(format!(
+                "artifact onion_super_root mismatch: predecessor={}, actual={}",
+                hex::encode(predecessor.onion_super_root),
+                hex::encode(layout.onion_super_root)
+            ));
+        }
+        verify_layout_anchor_and_seeds(&predecessor, &layout)?;
+
+        let params = rootbundle::BuildParamsV2::current_snapshot(
+            predecessor.index_bins_per_table,
+            predecessor.chunk_bins_per_table,
+            layout.entry_size,
+            layout.total_packed_entries,
+            layout.index_bins_per_table,
+            layout.chunk_bins_per_table,
+        );
+        let predecessor_payload_path = predecessor_dir.join("root-bundle-payload.bin");
+        let predecessor_payload_bytes = fs::read(&predecessor_payload_path)
+            .map_err(|e| format!("failed to read {}: {e}", predecessor_payload_path.display()))?;
+        let mut payload = rootbundle::RootBundlePayload::decode(&predecessor_payload_bytes)
+            .map_err(|e| format!("failed to decode predecessor root payload: {e}"))?;
+        payload.params_hash = params.params_hash();
+        payload.issued_at = issued_at
+            .parse::<i64>()
+            .map_err(|_| format!("issued-at-unix must be an i64: {issued_at}"))?;
+        let payload_bytes = payload
+            .encode()
+            .map_err(|e| format!("failed to encode v2 root payload: {e}"))?;
+
+        let out_dir = Path::new(out_dir);
+        fs::create_dir(out_dir)
+            .map_err(|e| format!("failed to create {}: {e}", out_dir.display()))?;
+        fs::create_dir(out_dir.join("server-db"))
+            .map_err(|e| format!("failed to create output server-db directory: {e}"))?;
+        fs::write(out_dir.join("root-bundle-payload.bin"), &payload_bytes)
+            .map_err(|e| format!("failed to write v2 root payload: {e}"))?;
+        for rel in [
+            "database.manifest.sha256",
+            "all-artifacts.manifest.sha256",
+            "server-db/MANIFEST.toml",
+        ] {
+            fs::copy(predecessor_dir.join(rel), out_dir.join(rel))
+                .map_err(|e| format!("failed to copy {rel}: {e}"))?;
+        }
+
+        let evidence = BuildEvidence {
+            version: EVIDENCE_VERSION_V2,
+            builder_git_commit: builder_git_commit.to_owned(),
+            builder_binary_sha256: sha256_file_32(Path::new(builder_binary))?,
+            tee_platform: tee_platform.to_owned(),
+            tee_image_measurement: parse_optional_hex_bytes(
+                tee_image_measurement_hex_or_none,
+                "tee-image-measurement-hex-or-none",
+            )?,
+            core_version: predecessor.core_version.clone(),
+            snapshot_sha256: predecessor.snapshot_sha256,
+            snapshot_bytes: predecessor.snapshot_bytes,
+            network_magic: predecessor.network_magic,
+            build_kind: predecessor.build_kind,
+            from_anchor: predecessor.from_anchor,
+            anchor: predecessor.anchor,
+            utxo_muhash: predecessor.utxo_muhash,
+            dust_threshold_sats: predecessor.dust_threshold_sats,
+            max_utxos_per_spk: predecessor.max_utxos_per_spk,
+            params_hash: params.params_hash(),
+            index_bins_per_table: predecessor.index_bins_per_table,
+            chunk_bins_per_table: predecessor.chunk_bins_per_table,
+            onion_entry_size: layout.entry_size,
+            bucket_super_root: predecessor.bucket_super_root,
+            onion_super_root: predecessor.onion_super_root,
+            root_bundle_payload_sha256: sha256_bytes(&payload_bytes),
+            signed_root_bundle_sha256: None,
+            database_manifest_sha256: sha256_file_32(&out_dir.join("database.manifest.sha256"))?,
+            all_artifacts_manifest_sha256: sha256_file_32(
+                &out_dir.join("all-artifacts.manifest.sha256"),
+            )?,
+            server_db_manifest_sha256: sha256_file_32(&out_dir.join("server-db/MANIFEST.toml"))?,
+            evidence_mode: 1,
+            predecessor_evidence_sha256: Some(sha256_bytes(&predecessor_bytes)),
+            onion_layout_v2: Some(OnionLayoutV2 {
+                total_packed_entries: layout.total_packed_entries,
+                index_bins_per_table: layout.index_bins_per_table,
+                chunk_bins_per_table: layout.chunk_bins_per_table,
+            }),
+        };
+        let encoded = evidence.encode()?;
+        fs::write(out_dir.join("build-evidence.bin"), encoded)
+            .map_err(|e| format!("failed to write v2 build evidence: {e}"))?;
+        Ok::<_, String>((evidence, layout, params.params_hash()))
+    })();
+
+    match result {
+        Ok((evidence, layout, params_hash)) => {
+            println!("status=ok");
+            println!("operation=reattest_existing");
+            println!("params_hash_v2={}", hex::encode(params_hash));
+            println!("onion_total_packed_entries={}", layout.total_packed_entries);
+            println!("onion_index_bins_per_table={}", layout.index_bins_per_table);
+            println!("onion_chunk_bins_per_table={}", layout.chunk_bins_per_table);
+            print_evidence_report(&evidence, None);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn verify_predecessor_proof_directory(dir: &Path, evidence: &BuildEvidence) -> Result<(), String> {
+    let payload_bytes = fs::read(dir.join("root-bundle-payload.bin"))
+        .map_err(|e| format!("failed to read predecessor root payload: {e}"))?;
+    expect_eq(
+        "root_bundle_payload_sha256",
+        &hex::encode(evidence.root_bundle_payload_sha256),
+        &hex::encode(sha256_bytes(&payload_bytes)),
+    )?;
+    let payload = rootbundle::RootBundlePayload::decode(&payload_bytes)
+        .map_err(|e| format!("failed to decode predecessor root payload: {e}"))?;
+    if payload.network_magic != evidence.network_magic
+        || payload.build_kind != evidence.build_kind
+        || payload.from_anchor != evidence.from_anchor
+        || payload.anchor != evidence.anchor
+        || payload.utxo_muhash != evidence.utxo_muhash
+        || payload.dust_threshold_sats != evidence.dust_threshold_sats
+        || payload.max_utxos_per_spk != evidence.max_utxos_per_spk
+        || payload.params_hash != evidence.params_hash
+        || payload.root("merkle/bucket/super_root") != Some(&evidence.bucket_super_root)
+        || payload.root("merkle/onion/super_root") != Some(&evidence.onion_super_root)
+    {
+        return Err("predecessor root payload does not match predecessor evidence".into());
+    }
+    let expected_v1 = rootbundle::BuildParamsV1::current_snapshot(
+        evidence.index_bins_per_table,
+        evidence.chunk_bins_per_table,
+        evidence.onion_entry_size,
+    )
+    .params_hash();
+    if expected_v1 != evidence.params_hash {
+        return Err("predecessor params_hash is not the canonical v1 layout hash".into());
+    }
+    for (rel, expected) in [
+        (
+            "database.manifest.sha256",
+            evidence.database_manifest_sha256,
+        ),
+        (
+            "all-artifacts.manifest.sha256",
+            evidence.all_artifacts_manifest_sha256,
+        ),
+        (
+            "server-db/MANIFEST.toml",
+            evidence.server_db_manifest_sha256,
+        ),
+    ] {
+        let actual = sha256_file_32(&dir.join(rel))?;
+        if actual != expected {
+            return Err(format!("predecessor {rel} hash mismatch"));
+        }
+    }
+    let report = fs::read(dir.join("build-evidence.sev-snp-report.bin"))
+        .map_err(|e| format!("failed to read predecessor SEV-SNP report: {e}"))?;
+    if extract_sev_snp_report_data(&report)? != evidence.report_data()? {
+        return Err("predecessor SEV-SNP REPORT_DATA mismatch".into());
+    }
+    Ok(())
+}
+
+fn verify_layout_anchor_and_seeds(
+    evidence: &BuildEvidence,
+    layout: &dbpipeline::ExistingOnionLayoutV2,
+) -> Result<(), String> {
+    let (anchor, index_master, chunk_master, index_tag) = match evidence.build_kind {
+        rootbundle::BuildKind::Snapshot => {
+            let anchor = evidence.anchor.to_bytes().to_vec();
+            let seeds = rootbundle::SnapshotSeeds::derive(&evidence.anchor);
+            (
+                anchor,
+                seeds.index_master,
+                seeds.chunk_master,
+                seeds.index_tag,
+            )
+        }
+        rootbundle::BuildKind::Delta => {
+            let delta = rootbundle::DeltaAnchor {
+                from: evidence.from_anchor,
+                to: evidence.anchor,
+            };
+            let seeds = rootbundle::DeltaSeeds::derive(&delta);
+            (
+                delta.to_bytes().to_vec(),
+                seeds.index_master,
+                seeds.chunk_master,
+                seeds.index_tag,
+            )
+        }
+    };
+    if layout.anchor_bytes != anchor {
+        return Err("artifact anchor does not match predecessor evidence".into());
+    }
+    if layout.index_master_seed != index_master
+        || layout.chunk_master_seed != chunk_master
+        || layout.index_tag_seed != index_tag
+    {
+        return Err("artifact Onion seeds do not match proof-bound chain anchor".into());
+    }
+    Ok(())
 }
 
 pub fn inspect_build_evidence(evidence_path: &str) -> ExitCode {
@@ -547,7 +850,7 @@ fn print_evidence_report(evidence: &BuildEvidence, evidence_path: Option<&str>) 
         .evidence_digest()
         .expect("encoding already validated");
     let report_data = evidence.report_data().expect("encoding already validated");
-    println!("evidence_version={EVIDENCE_VERSION}");
+    println!("evidence_version={}", evidence.version);
     if let Some(path) = evidence_path {
         println!("evidence_path={path}");
     }
@@ -619,6 +922,26 @@ fn print_evidence_report(evidence: &BuildEvidence, evidence_path: Option<&str>) 
         "server_db_manifest_sha256={}",
         hex::encode(evidence.server_db_manifest_sha256)
     );
+    if let Some(layout) = evidence.onion_layout_v2 {
+        println!(
+            "evidence_mode={}",
+            if evidence.evidence_mode == 1 {
+                "reattest_existing"
+            } else {
+                "full_build"
+            }
+        );
+        println!(
+            "predecessor_evidence_sha256={}",
+            evidence
+                .predecessor_evidence_sha256
+                .map(hex::encode)
+                .unwrap_or_else(|| "none".into())
+        );
+        println!("onion_total_packed_entries={}", layout.total_packed_entries);
+        println!("onion_index_bins_per_table={}", layout.index_bins_per_table);
+        println!("onion_chunk_bins_per_table={}", layout.chunk_bins_per_table);
+    }
 }
 
 impl BuildEvidence {
@@ -710,17 +1033,25 @@ fn load_evidence(path: &Path) -> Result<BuildEvidence, String> {
     BuildEvidence::decode(&bytes)
 }
 
-fn evidence_digest(evidence_bytes: &[u8]) -> Result<[u8; 32], String> {
+fn evidence_digest(version: u16, evidence_bytes: &[u8]) -> Result<[u8; 32], String> {
     let mut h = Sha256::new();
-    h.update(EVIDENCE_DOMAIN);
+    h.update(match version {
+        EVIDENCE_VERSION_V1 => EVIDENCE_V1_DOMAIN,
+        EVIDENCE_VERSION_V2 => EVIDENCE_V2_DOMAIN,
+        _ => return Err(format!("unsupported evidence version: {version}")),
+    });
     h.update(evidence_bytes);
     Ok(h.finalize().into())
 }
 
-fn report_data_for_evidence_bytes(evidence_bytes: &[u8]) -> Result<[u8; 64], String> {
-    let evidence_hash = evidence_digest(evidence_bytes)?;
+fn report_data_for_evidence_bytes(version: u16, evidence_bytes: &[u8]) -> Result<[u8; 64], String> {
+    let evidence_hash = evidence_digest(version, evidence_bytes)?;
     let mut high = Sha256::new();
-    high.update(REPORT_DATA_DOMAIN);
+    high.update(match version {
+        EVIDENCE_VERSION_V1 => REPORT_DATA_V1_DOMAIN,
+        EVIDENCE_VERSION_V2 => REPORT_DATA_V2_DOMAIN,
+        _ => return Err(format!("unsupported evidence version: {version}")),
+    });
     high.update(evidence_hash);
     let high: [u8; 32] = high.finalize().into();
 
@@ -1041,6 +1372,7 @@ mod tests {
 
     fn sample_evidence() -> BuildEvidence {
         BuildEvidence {
+            version: EVIDENCE_VERSION_V1,
             builder_git_commit: "abc123".into(),
             builder_binary_sha256: [1u8; 32],
             tee_platform: "sev-snp".into(),
@@ -1072,6 +1404,9 @@ mod tests {
             database_manifest_sha256: [11u8; 32],
             all_artifacts_manifest_sha256: [12u8; 32],
             server_db_manifest_sha256: [13u8; 32],
+            evidence_mode: 0,
+            predecessor_evidence_sha256: None,
+            onion_layout_v2: None,
         }
     }
 
@@ -1086,7 +1421,7 @@ mod tests {
     fn report_data_is_full_64_byte_binding() {
         let evidence = sample_evidence();
         let encoded = evidence.encode().unwrap();
-        let evidence_hash = evidence_digest(&encoded).unwrap();
+        let evidence_hash = evidence_digest(evidence.version, &encoded).unwrap();
         let report_data = evidence.report_data().unwrap();
         assert_eq!(&report_data[..32], &evidence_hash);
         assert_ne!(&report_data[32..], &[0u8; 32]);
@@ -1094,6 +1429,27 @@ mod tests {
         let mut changed = evidence.clone();
         changed.server_db_manifest_sha256 = [99u8; 32];
         assert_ne!(report_data, changed.report_data().unwrap());
+    }
+
+    #[test]
+    fn v2_evidence_roundtrip_binds_layout_and_predecessor() {
+        let mut evidence = sample_evidence();
+        evidence.version = EVIDENCE_VERSION_V2;
+        evidence.evidence_mode = 1;
+        evidence.predecessor_evidence_sha256 = Some([14u8; 32]);
+        evidence.onion_layout_v2 = Some(OnionLayoutV2 {
+            total_packed_entries: 123,
+            index_bins_per_table: 456,
+            chunk_bins_per_table: 789,
+        });
+        let encoded = evidence.encode().unwrap();
+        assert_eq!(BuildEvidence::decode(&encoded).unwrap(), evidence);
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(BuildEvidence::decode(&trailing)
+            .unwrap_err()
+            .contains("trailing"));
     }
 
     #[test]

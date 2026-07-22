@@ -190,6 +190,7 @@ pub enum PipelineError {
         expected_bytes: u64,
         actual_bytes: u64,
     },
+    InvalidExistingOnionLayout(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -284,6 +285,9 @@ impl fmt::Display for PipelineError {
                 "invalid cuckoo body {}: expected {expected_bytes} bytes, got {actual_bytes}",
                 path.display()
             ),
+            PipelineError::InvalidExistingOnionLayout(reason) => {
+                write!(f, "invalid existing OnionPIR layout: {reason}")
+            }
         }
     }
 }
@@ -419,6 +423,22 @@ pub struct OnionIndexCuckooBuildReport {
     pub meta_file_bytes: u64,
     pub bin_hashes_file_bytes: u64,
     pub total_placements: u64,
+}
+
+/// Layout recovered from, and cryptographically checked against, a completed
+/// OnionPIR artifact directory. This is intentionally derived from final
+/// files rather than build logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingOnionLayoutV2 {
+    pub total_packed_entries: u32,
+    pub entry_size: u32,
+    pub index_bins_per_table: u32,
+    pub chunk_bins_per_table: u32,
+    pub index_master_seed: u64,
+    pub index_tag_seed: u64,
+    pub chunk_master_seed: u64,
+    pub anchor_bytes: Vec<u8>,
+    pub onion_super_root: [u8; MERKLE_HASH_SIZE],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2474,6 +2494,431 @@ fn build_onion_merkle_inner(
     })
 }
 
+/// Verify a completed OnionPIR directory and recover the three v2-only query
+/// dimensions. The large table files are scanned against their stored leaf
+/// hashes; the ordered roots and tree-top cache are then checked against the
+/// proof-bound super-root. No build log is trusted.
+pub fn inspect_existing_onion_layout_v2(
+    dir: impl AsRef<Path>,
+) -> Result<ExistingOnionLayoutV2, PipelineError> {
+    let dir = dir.as_ref();
+    let invalid = |message: String| PipelineError::InvalidExistingOnionLayout(message);
+
+    let index_meta_path = dir.join(ONION_INDEX_META_FILENAME);
+    let index_meta = std::fs::read(&index_meta_path)?;
+    if index_meta.len() < ONION_INDEX_META_HEADER_SIZE {
+        return Err(invalid(format!(
+            "{} is truncated",
+            index_meta_path.display()
+        )));
+    }
+    let index_anchor_len = onion_anchor_len(
+        u64::from_le_bytes(index_meta[0..8].try_into().unwrap()),
+        ONION_INDEX_META_MAGIC,
+    )?;
+    if index_meta.len() != ONION_INDEX_META_HEADER_SIZE + index_anchor_len {
+        return Err(invalid(format!(
+            "{} has wrong length: expected {}, got {}",
+            index_meta_path.display(),
+            ONION_INDEX_META_HEADER_SIZE + index_anchor_len,
+            index_meta.len()
+        )));
+    }
+    let index_k = u32::from_le_bytes(index_meta[8..12].try_into().unwrap());
+    let index_hashes = u32::from_le_bytes(index_meta[12..16].try_into().unwrap());
+    let index_slots = u32::from_le_bytes(index_meta[16..20].try_into().unwrap());
+    let index_bins = u32::from_le_bytes(index_meta[20..24].try_into().unwrap());
+    let index_master_seed = u64::from_le_bytes(index_meta[24..32].try_into().unwrap());
+    let index_tag_seed = u64::from_le_bytes(index_meta[32..40].try_into().unwrap());
+    let index_slot_size = u32::from_le_bytes(index_meta[40..44].try_into().unwrap());
+    if index_k != INDEX_K as u32
+        || index_hashes != ONION_INDEX_CUCKOO_HASHES as u32
+        || index_slot_size != ONION_INDEX_SLOT_SIZE as u32
+        || index_slots == 0
+        || index_bins == 0
+    {
+        return Err(invalid(format!(
+            "bad index geometry: k={index_k} hashes={index_hashes} slots={index_slots} bins={index_bins} slot_size={index_slot_size}"
+        )));
+    }
+    let anchor_bytes = index_meta[ONION_INDEX_META_HEADER_SIZE..].to_vec();
+
+    let chunk_path = dir.join(ONION_CHUNK_CUCKOO_FILENAME);
+    let mut chunk_header = [0u8; ONION_DATA_CUCKOO_HEADER_SIZE];
+    let chunk_file = File::open(&chunk_path)?;
+    chunk_file.read_exact_at(&mut chunk_header, 0)?;
+    let chunk_anchor_len = onion_anchor_len(
+        u64::from_le_bytes(chunk_header[0..8].try_into().unwrap()),
+        ONION_DATA_CUCKOO_MAGIC,
+    )?;
+    let chunk_k = u32::from_le_bytes(chunk_header[8..12].try_into().unwrap());
+    let chunk_hashes = u32::from_le_bytes(chunk_header[12..16].try_into().unwrap());
+    let chunk_bins = u32::from_le_bytes(chunk_header[16..20].try_into().unwrap());
+    let chunk_master_seed = u64::from_le_bytes(chunk_header[20..28].try_into().unwrap());
+    let total_packed_entries = u32::from_le_bytes(chunk_header[28..32].try_into().unwrap());
+    if chunk_k != CHUNK_K as u32
+        || chunk_hashes != ONION_DATA_CUCKOO_HASHES as u32
+        || chunk_bins == 0
+        || chunk_header[32..36] != [0u8; 4]
+    {
+        return Err(invalid(format!(
+            "bad chunk geometry: k={chunk_k} hashes={chunk_hashes} bins={chunk_bins} reserved={:?}",
+            &chunk_header[32..36]
+        )));
+    }
+    let chunk_header_size = ONION_DATA_CUCKOO_HEADER_SIZE + chunk_anchor_len;
+    let expected_chunk_bytes = (chunk_header_size as u64)
+        .checked_add(CHUNK_K as u64 * chunk_bins as u64 * 4)
+        .ok_or_else(|| invalid("chunk file length overflow".into()))?;
+    let actual_chunk_bytes = chunk_file.metadata()?.len();
+    if actual_chunk_bytes != expected_chunk_bytes {
+        return Err(invalid(format!(
+            "{} has wrong length: expected {expected_chunk_bytes}, got {actual_chunk_bytes}",
+            chunk_path.display()
+        )));
+    }
+    let mut chunk_anchor = vec![0u8; chunk_anchor_len];
+    chunk_file.read_exact_at(&mut chunk_anchor, ONION_DATA_CUCKOO_HEADER_SIZE as u64)?;
+    if chunk_anchor != anchor_bytes {
+        return Err(invalid("index and chunk anchors differ".into()));
+    }
+
+    let entry_size = inspect_onion_sibling_entry_size(dir)?;
+    if index_slots
+        .checked_mul(index_slot_size)
+        .ok_or_else(|| invalid("index slot geometry overflow".into()))?
+        > entry_size
+    {
+        return Err(invalid("index slots exceed Onion entry size".into()));
+    }
+    if entry_size == 0 || entry_size % MERKLE_HASH_SIZE as u32 != 0 {
+        return Err(invalid(format!("invalid Onion entry size {entry_size}")));
+    }
+
+    let packed_path = dir.join(ONION_PACKED_ENTRIES_FILENAME);
+    let packed_file = File::open(&packed_path)?;
+    let expected_packed_bytes = total_packed_entries as u64 * entry_size as u64;
+    if packed_file.metadata()?.len() != expected_packed_bytes {
+        return Err(invalid(format!(
+            "{} length does not match total_packed_entries * entry_size",
+            packed_path.display()
+        )));
+    }
+    let index_bins_path = dir.join(ONION_INDEX_BINS_FILENAME);
+    let index_bins_file = File::open(&index_bins_path)?;
+    let expected_index_bytes = INDEX_K as u64 * index_bins as u64 * entry_size as u64;
+    if index_bins_file.metadata()?.len() != expected_index_bytes {
+        return Err(invalid(format!(
+            "{} length does not match index geometry",
+            index_bins_path.display()
+        )));
+    }
+
+    let index_roots = verify_existing_index_leaf_hashes(
+        &index_bins_file,
+        &dir.join(ONION_INDEX_BIN_HASHES_FILENAME),
+        index_bins,
+        entry_size,
+    )?;
+    let chunk_roots = verify_existing_chunk_leaf_hashes(
+        &chunk_file,
+        chunk_header_size,
+        &packed_file,
+        &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+        chunk_bins,
+        entry_size,
+    )?;
+    let roots: Vec<Hash256> = index_roots.into_iter().chain(chunk_roots).collect();
+    let roots_path = dir.join(ONION_MERKLE_ROOTS_FILENAME);
+    let roots_bytes = std::fs::read(&roots_path)?;
+    let computed_roots: Vec<u8> = roots.iter().flatten().copied().collect();
+    if roots_bytes != computed_roots {
+        return Err(invalid(format!(
+            "{} does not match roots recomputed from actual tables",
+            roots_path.display()
+        )));
+    }
+    let onion_super_root = sha256(&computed_roots);
+    let root_path = dir.join(ONION_MERKLE_ROOT_FILENAME);
+    if std::fs::read(&root_path)? != onion_super_root {
+        return Err(invalid(format!(
+            "{} does not match ordered Onion roots",
+            root_path.display()
+        )));
+    }
+    verify_existing_tree_tops(
+        &dir.join(ONION_MERKLE_TREE_TOPS_FILENAME),
+        &roots,
+        index_bins,
+        chunk_bins,
+        entry_size / MERKLE_HASH_SIZE as u32,
+    )?;
+
+    Ok(ExistingOnionLayoutV2 {
+        total_packed_entries,
+        entry_size,
+        index_bins_per_table: index_bins,
+        chunk_bins_per_table: chunk_bins,
+        index_master_seed,
+        index_tag_seed,
+        chunk_master_seed,
+        anchor_bytes,
+        onion_super_root,
+    })
+}
+
+fn onion_anchor_len(magic: u64, base: u64) -> Result<usize, PipelineError> {
+    if magic == base {
+        Ok(0)
+    } else if magic == base ^ ANCHOR_MAGIC_SNAPSHOT_XOR {
+        Ok(CHAIN_ANCHOR_BYTES)
+    } else if magic == base ^ ANCHOR_MAGIC_DELTA_XOR {
+        Ok(DELTA_ANCHOR_BYTES)
+    } else {
+        Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "unknown Onion header magic 0x{magic:016x}"
+        )))
+    }
+}
+
+fn inspect_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
+    let mut sizes = Vec::new();
+    for (filename, magic, k) in [
+        (
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_ROWS_INDEX_MAGIC,
+            INDEX_K as u32,
+        ),
+        (
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
+            ONION_MERKLE_SIB_ROWS_DATA_MAGIC,
+            CHUNK_K as u32,
+        ),
+    ] {
+        let path = dir.join(filename);
+        let bytes = std::fs::read(&path)?;
+        if bytes.len() < ONION_MERKLE_SIB_ROWS_HEADER_SIZE {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "{} is truncated",
+                path.display()
+            )));
+        }
+        let actual_magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let actual_k = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let arity = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let rows = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let row_bytes = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let expected = ONION_MERKLE_SIB_ROWS_HEADER_SIZE as u64
+            + actual_k as u64 * rows as u64 * row_bytes as u64;
+        if actual_magic != magic
+            || actual_k != k
+            || arity == 0
+            || row_bytes != arity * MERKLE_HASH_SIZE as u32
+            || bytes.len() as u64 != expected
+        {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "bad sibling rows header or length in {}",
+                path.display()
+            )));
+        }
+        sizes.push(row_bytes);
+    }
+    if sizes[0] != sizes[1] {
+        return Err(PipelineError::InvalidExistingOnionLayout(
+            "index and chunk sibling row sizes differ".into(),
+        ));
+    }
+    Ok(sizes[0])
+}
+
+fn verify_existing_index_leaf_hashes(
+    bins: &File,
+    hashes_path: &Path,
+    bins_per_table: u32,
+    entry_size: u32,
+) -> Result<Vec<Hash256>, PipelineError> {
+    let mut hashes = BufReader::new(File::open(hashes_path)?);
+    verify_hash_header(&mut hashes, hashes_path, INDEX_K as u32, bins_per_table)?;
+    let mut entry = vec![0u8; entry_size as usize];
+    let mut expected = [0u8; MERKLE_HASH_SIZE];
+    let mut roots = Vec::with_capacity(INDEX_K);
+    for group in 0..INDEX_K {
+        let mut leaves = Vec::with_capacity(bins_per_table as usize);
+        for bin in 0..bins_per_table as usize {
+            let offset = ((group * bins_per_table as usize + bin) * entry_size as usize) as u64;
+            bins.read_exact_at(&mut entry, offset)?;
+            hashes.read_exact(&mut expected)?;
+            let actual = sha256(&entry);
+            if actual != expected {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "index leaf hash mismatch at group {group}, bin {bin}"
+                )));
+            }
+            leaves.push(actual);
+        }
+        roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
+    }
+    ensure_reader_eof(&mut hashes, hashes_path)?;
+    Ok(roots)
+}
+
+fn verify_existing_chunk_leaf_hashes(
+    cuckoo: &File,
+    header_size: usize,
+    packed: &File,
+    hashes_path: &Path,
+    bins_per_table: u32,
+    entry_size: u32,
+) -> Result<Vec<Hash256>, PipelineError> {
+    let mut hashes = BufReader::new(File::open(hashes_path)?);
+    verify_hash_header(&mut hashes, hashes_path, CHUNK_K as u32, bins_per_table)?;
+    let mut entry = vec![0u8; entry_size as usize];
+    let zero_hash = sha256(&entry);
+    let mut expected = [0u8; MERKLE_HASH_SIZE];
+    let mut id_bytes = [0u8; 4];
+    let mut roots = Vec::with_capacity(CHUNK_K);
+    for group in 0..CHUNK_K {
+        let mut leaves = Vec::with_capacity(bins_per_table as usize);
+        for bin in 0..bins_per_table as usize {
+            let ordinal = group * bins_per_table as usize + bin;
+            cuckoo.read_exact_at(&mut id_bytes, (header_size + ordinal * 4) as u64)?;
+            let entry_id = u32::from_le_bytes(id_bytes);
+            let actual = if entry_id == EMPTY {
+                zero_hash
+            } else {
+                packed.read_exact_at(&mut entry, entry_id as u64 * entry_size as u64)?;
+                sha256(&entry)
+            };
+            hashes.read_exact(&mut expected)?;
+            if actual != expected {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "chunk leaf hash mismatch at group {group}, bin {bin}"
+                )));
+            }
+            leaves.push(actual);
+        }
+        roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
+    }
+    ensure_reader_eof(&mut hashes, hashes_path)?;
+    Ok(roots)
+}
+
+fn verify_hash_header(
+    reader: &mut impl Read,
+    path: &Path,
+    expected_k: u32,
+    expected_bins: u32,
+) -> Result<(), PipelineError> {
+    let mut header = [0u8; 8];
+    reader.read_exact(&mut header)?;
+    let k = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let bins = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if k != expected_k || bins != expected_bins {
+        return Err(PipelineError::InvalidBinHashes {
+            path: path.to_path_buf(),
+            reason: format!("k={k}, bins={bins}; expected k={expected_k}, bins={expected_bins}"),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_reader_eof(reader: &mut impl Read, path: &Path) -> Result<(), PipelineError> {
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(PipelineError::InvalidBinHashes {
+            path: path.to_path_buf(),
+            reason: "trailing bytes".into(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_existing_tree_tops(
+    path: &Path,
+    roots: &[Hash256],
+    index_bins: u32,
+    chunk_bins: u32,
+    arity: u32,
+) -> Result<(), PipelineError> {
+    let data = std::fs::read(path)?;
+    if data.len() < 4 {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} is truncated",
+            path.display()
+        )));
+    }
+    let tree_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if tree_count != roots.len() {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "tree-top count {tree_count} does not equal root count {}",
+            roots.len()
+        )));
+    }
+    let mut pos = 4usize;
+    for (tree, root) in roots.iter().enumerate() {
+        if pos + 8 > data.len() {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "tree-top record {tree} is truncated"
+            )));
+        }
+        let cache_from = data[pos];
+        let total_nodes = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap());
+        let record_arity = u16::from_le_bytes(data[pos + 5..pos + 7].try_into().unwrap()) as u32;
+        let levels = data[pos + 7] as usize;
+        pos += 8;
+        let bins = if tree < INDEX_K {
+            index_bins
+        } else {
+            chunk_bins
+        };
+        let mut expected_count = bins.div_ceil(arity);
+        let mut seen_nodes = 0u32;
+        let mut last_root = None;
+        if cache_from != ONION_MERKLE_CACHE_FROM_LEVEL as u8 || record_arity != arity {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "tree-top record {tree} has wrong cache level or arity"
+            )));
+        }
+        for level in 0..levels {
+            if pos + 4 > data.len() {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "tree-top record {tree} level header is truncated"
+                )));
+            }
+            let count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            if count != expected_count {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "tree-top record {tree} level {level} has {count} nodes, expected {expected_count}"
+                )));
+            }
+            let bytes = count as usize * MERKLE_HASH_SIZE;
+            if pos + bytes > data.len() {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "tree-top record {tree} level {level} body is truncated"
+                )));
+            }
+            if count == 1 {
+                last_root = Some(data[pos..pos + MERKLE_HASH_SIZE].try_into().unwrap());
+            }
+            pos += bytes;
+            seen_nodes += count;
+            expected_count = count.div_ceil(arity);
+        }
+        if seen_nodes != total_nodes || last_root.as_ref() != Some(root) || expected_count != 1 {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "tree-top record {tree} totals or root mismatch"
+            )));
+        }
+    }
+    if pos != data.len() {
+        return Err(PipelineError::InvalidExistingOnionLayout(
+            "tree-top file has trailing bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("out");
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
@@ -4397,6 +4842,86 @@ mod tests {
         assert!(!merkle_anchor_root_only
             .join(MERKLE_BUCKET_ROOTS_FILENAME)
             .exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_onion_layout_v2_checks_final_tables_and_roots() {
+        let dir = fresh_temp_dir("existing-onion-v2");
+        let entry_size = 64usize;
+        let packed = vec![0x5au8; entry_size];
+        std::fs::write(dir.join(ONION_PACKED_ENTRIES_FILENAME), &packed).unwrap();
+
+        let index_options = OnionIndexCuckooOptions {
+            entry_size,
+            ..Default::default()
+        };
+        write_onion_index_meta(
+            &dir.join(ONION_INDEX_META_FILENAME),
+            2,
+            entry_size / ONION_INDEX_SLOT_SIZE,
+            &index_options,
+        )
+        .unwrap();
+        let index_bin = vec![0u8; entry_size];
+        std::fs::write(
+            dir.join(ONION_INDEX_BINS_FILENAME),
+            index_bin.repeat(INDEX_K * 2),
+        )
+        .unwrap();
+        let mut index_hashes = Vec::new();
+        index_hashes.extend_from_slice(&(INDEX_K as u32).to_le_bytes());
+        index_hashes.extend_from_slice(&2u32.to_le_bytes());
+        for _ in 0..INDEX_K * 2 {
+            index_hashes.extend_from_slice(&sha256(&index_bin));
+        }
+        std::fs::write(dir.join(ONION_INDEX_BIN_HASHES_FILENAME), index_hashes).unwrap();
+
+        let chunk_options = OnionDataCuckooOptions {
+            entry_size,
+            ..Default::default()
+        };
+        let chunk_tables = vec![vec![0, EMPTY]; CHUNK_K];
+        write_onion_data_cuckoo_file(
+            &dir.join(ONION_CHUNK_CUCKOO_FILENAME),
+            &chunk_tables,
+            2,
+            1,
+            &chunk_options,
+        )
+        .unwrap();
+        write_onion_data_bin_hashes(
+            &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &dir.join(ONION_PACKED_ENTRIES_FILENAME),
+            &chunk_tables,
+            2,
+            &chunk_options,
+        )
+        .unwrap();
+        build_onion_merkle(
+            dir.join(ONION_INDEX_BIN_HASHES_FILENAME),
+            dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+            &dir,
+            &OnionMerkleOptions {
+                entry_size,
+                root_only: false,
+            },
+        )
+        .unwrap();
+
+        let layout = inspect_existing_onion_layout_v2(&dir).unwrap();
+        assert_eq!(layout.total_packed_entries, 1);
+        assert_eq!(layout.entry_size, 64);
+        assert_eq!(layout.index_bins_per_table, 2);
+        assert_eq!(layout.chunk_bins_per_table, 2);
+
+        let mut tampered = std::fs::read(dir.join(ONION_INDEX_BINS_FILENAME)).unwrap();
+        tampered[0] ^= 1;
+        std::fs::write(dir.join(ONION_INDEX_BINS_FILENAME), tampered).unwrap();
+        assert!(inspect_existing_onion_layout_v2(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("index leaf hash mismatch"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

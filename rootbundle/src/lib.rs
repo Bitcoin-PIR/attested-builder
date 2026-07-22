@@ -24,6 +24,7 @@ use std::path::Path;
 /// to the payload layout must bump both this tag and `PAYLOAD_VERSION`.
 pub const SIGNING_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/root-bundle/v1\0";
 pub const PARAMS_HASH_DOMAIN: &[u8] = b"BitcoinPIR/attested-builder/build-params/v1\0";
+pub const PARAMS_HASH_V2_DOMAIN: &[u8] = b"BPIR_BUILD_PARAMS_V2\0";
 pub const SEED_TAG_PREFIX_V1: &[u8] = b"BitcoinPIR/seed/v1/";
 
 /// Payload layout version (field of the payload itself).
@@ -356,6 +357,142 @@ impl BuildParamsV1 {
     pub fn params_hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(PARAMS_HASH_DOMAIN);
+        h.update(self.encode());
+        h.finalize().into()
+    }
+}
+
+/// Complete, typed OnionPIR query layout committed by database proof v2.
+///
+/// V2 deliberately embeds every V1 field rather than hashing an unsigned
+/// extension.  The final three values are the production query dimensions
+/// that could previously only be learned from an untrusted server-info
+/// response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildParamsV2 {
+    pub base: BuildParamsV1,
+    pub onion_total_packed_entries: u32,
+    pub onion_index_bins_per_table: u32,
+    pub onion_chunk_bins_per_table: u32,
+}
+
+impl BuildParamsV2 {
+    pub fn current_snapshot(
+        index_bins_per_table: u32,
+        chunk_bins_per_table: u32,
+        onion_entry_size: u32,
+        onion_total_packed_entries: u32,
+        onion_index_bins_per_table: u32,
+        onion_chunk_bins_per_table: u32,
+    ) -> Self {
+        Self {
+            base: BuildParamsV1::current_snapshot(
+                index_bins_per_table,
+                chunk_bins_per_table,
+                onion_entry_size,
+            ),
+            onion_total_packed_entries,
+            onion_index_bins_per_table,
+            onion_chunk_bins_per_table,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.base.encode();
+        out[0..2].copy_from_slice(&2u16.to_le_bytes());
+        put_bytes(&mut out, &self.onion_total_packed_entries.to_le_bytes());
+        put_bytes(&mut out, &self.onion_index_bins_per_table.to_le_bytes());
+        put_bytes(&mut out, &self.onion_chunk_bins_per_table.to_le_bytes());
+        out
+    }
+
+    /// Decode the fixed-width canonical representation. Unknown versions,
+    /// invalid booleans, truncation, and trailing bytes are all rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            pos: usize,
+        }
+        impl Reader<'_> {
+            fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+                let end = self.pos.checked_add(N).ok_or("parameter length overflow")?;
+                let value = self
+                    .bytes
+                    .get(self.pos..end)
+                    .ok_or("truncated build parameters")?;
+                self.pos = end;
+                Ok(value.try_into().unwrap())
+            }
+            fn u8(&mut self) -> Result<u8, &'static str> {
+                Ok(self.take::<1>()?[0])
+            }
+            fn u16(&mut self) -> Result<u16, &'static str> {
+                Ok(u16::from_le_bytes(self.take()?))
+            }
+            fn u32(&mut self) -> Result<u32, &'static str> {
+                Ok(u32::from_le_bytes(self.take()?))
+            }
+            fn u64(&mut self) -> Result<u64, &'static str> {
+                Ok(u64::from_le_bytes(self.take()?))
+            }
+            fn table(&mut self) -> Result<TableParamsV1, &'static str> {
+                let value = TableParamsV1 {
+                    k: self.u16()?,
+                    pbc_num_hashes: self.u16()?,
+                    bins_per_table: self.u32()?,
+                    slots_per_bin: self.u16()?,
+                    cuckoo_num_hashes: self.u16()?,
+                    slot_size: self.u16()?,
+                    dpf_n: self.u8()?,
+                    magic: self.u64()?,
+                    header_size: self.u16()?,
+                    has_tag_seed: match self.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("invalid has_tag_seed boolean"),
+                    },
+                };
+                Ok(value)
+            }
+        }
+
+        let mut r = Reader { bytes, pos: 0 };
+        if r.u16()? != 2 {
+            return Err("unsupported build parameters version");
+        }
+        let base = BuildParamsV1 {
+            flat_utxo_entry_size: r.u16()?,
+            script_hash_size: r.u16()?,
+            txid_size: r.u16()?,
+            index_record_size: r.u16()?,
+            chunk_size: r.u16()?,
+            chunks_per_unit: r.u16()?,
+            index: r.table()?,
+            chunk: r.table()?,
+            onion_entry_size: r.u32()?,
+            onion_index_record_size: r.u16()?,
+            onion_index_slot_size: r.u16()?,
+            onion_index_slots_per_bin: r.u16()?,
+            onion_chunk_k: r.u16()?,
+            merkle_arity: r.u16()?,
+            merkle_hash_bytes: r.u16()?,
+            chunk_merkle_item_pad: r.u16()?,
+        };
+        let decoded = Self {
+            base,
+            onion_total_packed_entries: r.u32()?,
+            onion_index_bins_per_table: r.u32()?,
+            onion_chunk_bins_per_table: r.u32()?,
+        };
+        if r.pos != bytes.len() {
+            return Err("trailing build parameter bytes");
+        }
+        Ok(decoded)
+    }
+
+    pub fn params_hash(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(PARAMS_HASH_V2_DOMAIN);
         h.update(self.encode());
         h.finalize().into()
     }
@@ -918,6 +1055,31 @@ mod tests {
         assert_eq!(p.params_hash(), same.params_hash());
         assert_ne!(p.params_hash(), different_bins.params_hash());
         assert_ne!(p.params_hash(), different_onion.params_hash());
+    }
+
+    #[test]
+    fn build_params_v2_canonical_hash_and_roundtrip() {
+        let p = BuildParamsV2::current_snapshot(
+            565_684, 1_064_454, 3_328, 1_234_567, 612_345, 1_345_678,
+        );
+        assert_eq!(p.encode().len(), 96);
+        assert_eq!(BuildParamsV2::decode(&p.encode()).unwrap(), p);
+        assert_eq!(
+            hex::encode(p.params_hash()),
+            "da2d3ad06596a646c8a9c516a904d1d79d8fbb8df0591a8a8f3135283d88592c"
+        );
+
+        let mut trailing = p.encode();
+        trailing.push(0);
+        assert_eq!(
+            BuildParamsV2::decode(&trailing),
+            Err("trailing build parameter bytes")
+        );
+        let different_total = BuildParamsV2 {
+            onion_total_packed_entries: p.onion_total_packed_entries + 1,
+            ..p
+        };
+        assert_ne!(p.params_hash(), different_total.params_hash());
     }
 
     #[test]
