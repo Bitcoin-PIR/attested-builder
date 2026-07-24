@@ -2584,12 +2584,11 @@ pub fn inspect_existing_onion_layout_v2(
     }
 
     let entry_size = inspect_onion_sibling_entry_size(dir)?;
-    if index_slots
-        .checked_mul(index_slot_size)
-        .ok_or_else(|| invalid("index slot geometry overflow".into()))?
-        > entry_size
-    {
-        return Err(invalid("index slots exceed Onion entry size".into()));
+    let expected_index_slots = entry_size / ONION_INDEX_SLOT_SIZE as u32;
+    if index_slots != expected_index_slots {
+        return Err(invalid(format!(
+            "index slots per bin {index_slots} do not match entry-derived value {expected_index_slots}"
+        )));
     }
     if entry_size == 0 || entry_size % MERKLE_HASH_SIZE as u32 != 0 {
         return Err(invalid(format!("invalid Onion entry size {entry_size}")));
@@ -4967,6 +4966,20 @@ mod tests {
         assert_eq!(layout.entry_size, 64);
         assert_eq!(layout.index_bins_per_table, 2);
         assert_eq!(layout.chunk_bins_per_table, 2);
+
+        // The index metadata header is not part of the Merkle super-root.
+        // Its query geometry must nevertheless match the layout v2 derives
+        // from the proof-bound entry size.
+        let index_meta_path = dir.join(ONION_INDEX_META_FILENAME);
+        let original_index_meta = std::fs::read(&index_meta_path).unwrap();
+        let mut bad_index_meta = original_index_meta.clone();
+        bad_index_meta[16..20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&index_meta_path, bad_index_meta).unwrap();
+        assert!(inspect_existing_onion_layout_v2(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("do not match entry-derived value"));
+        std::fs::write(&index_meta_path, original_index_meta).unwrap();
 
         // The Merkle root does not cover the packed-entry count in the chunk
         // header. Inflating that count and appending an unreferenced entry must
