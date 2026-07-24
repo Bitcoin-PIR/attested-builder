@@ -422,6 +422,7 @@ pub fn attest_existing_layout(
         payload.issued_at = issued_at
             .parse::<i64>()
             .map_err(|_| format!("issued-at-unix must be an i64: {issued_at}"))?;
+        bind_scanned_artifact_roots(&mut payload, Path::new(artifact_dir))?;
         let payload_bytes = payload
             .encode()
             .map_err(|e| format!("failed to encode v2 root payload: {e}"))?;
@@ -505,6 +506,55 @@ pub fn attest_existing_layout(
             ExitCode::from(1)
         }
     }
+}
+
+fn bind_scanned_artifact_roots(
+    payload: &mut rootbundle::RootBundlePayload,
+    artifact_dir: &Path,
+) -> Result<(), String> {
+    // Re-attestation may run after raw packed/index/sibling-row inputs have
+    // been deleted. Bind every artifact that the consistency scanner did use,
+    // including the final preprocessed images opened by the online server.
+    // Existing labels are replaced rather than duplicated because root-bundle
+    // encoding requires a strictly sorted unique label set.
+    let filenames = [
+        dbpipeline::ONION_INDEX_META_FILENAME,
+        dbpipeline::ONION_CHUNK_CUCKOO_FILENAME,
+        dbpipeline::ONION_INDEX_BIN_HASHES_FILENAME,
+        dbpipeline::ONION_DATA_BIN_HASHES_FILENAME,
+        dbpipeline::ONION_MERKLE_TREE_TOPS_FILENAME,
+        dbpipeline::ONION_MERKLE_ROOTS_FILENAME,
+        dbpipeline::ONION_MERKLE_ROOT_FILENAME,
+        dbpipeline::ONION_PACKED_ENTRIES_FILENAME,
+        dbpipeline::ONION_INDEX_BINS_FILENAME,
+        dbpipeline::ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+        dbpipeline::ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
+        dbpipeline::ONION_SHARED_NTT_FILENAME,
+        dbpipeline::ONION_INDEX_ALL_FILENAME,
+        dbpipeline::ONION_MERKLE_SIB_INDEX_FILENAME,
+        dbpipeline::ONION_MERKLE_SIB_DATA_FILENAME,
+    ];
+    for filename in filenames {
+        let path = artifact_dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "re-attested artifact is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let label = format!("file-sha256/{filename}");
+        let root = sha256_file_32(&path)?;
+        if let Some(existing) = payload.roots.iter_mut().find(|entry| entry.label == label) {
+            existing.root = root;
+        } else {
+            payload.roots.push(rootbundle::NamedRoot { label, root });
+        }
+    }
+    payload.roots.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(())
 }
 
 fn verify_predecessor_proof_directory(
@@ -1459,6 +1509,56 @@ mod tests {
         let evidence = sample_evidence();
         let encoded = evidence.encode().unwrap();
         assert_eq!(BuildEvidence::decode(&encoded).unwrap(), evidence);
+    }
+
+    #[test]
+    fn reattestation_payload_binds_final_serving_image_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "attested-builder-serving-roots-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(dbpipeline::ONION_SHARED_NTT_FILENAME), b"ntt-v2").unwrap();
+        fs::write(dir.join(dbpipeline::ONION_INDEX_ALL_FILENAME), b"index-v2").unwrap();
+        let mut payload = rootbundle::RootBundlePayload {
+            network_magic: [0xf9, 0xbe, 0xb4, 0xd9],
+            build_kind: rootbundle::BuildKind::Snapshot,
+            from_anchor: rootbundle::ChainAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
+            anchor: rootbundle::ChainAnchor {
+                block_hash: [1u8; 32],
+                height: 1,
+            },
+            utxo_muhash: [2u8; 32],
+            dust_threshold_sats: 576,
+            max_utxos_per_spk: 100,
+            params_hash: [3u8; 32],
+            issued_at: 1,
+            roots: vec![rootbundle::NamedRoot {
+                label: format!("file-sha256/{}", dbpipeline::ONION_SHARED_NTT_FILENAME),
+                root: [0u8; 32],
+            }],
+        };
+        bind_scanned_artifact_roots(&mut payload, &dir).unwrap();
+        assert_eq!(
+            payload.root(&format!(
+                "file-sha256/{}",
+                dbpipeline::ONION_SHARED_NTT_FILENAME
+            )),
+            Some(&sha256_bytes(b"ntt-v2"))
+        );
+        assert_eq!(
+            payload.root(&format!(
+                "file-sha256/{}",
+                dbpipeline::ONION_INDEX_ALL_FILENAME
+            )),
+            Some(&sha256_bytes(b"index-v2"))
+        );
+        payload.encode().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
