@@ -2625,8 +2625,10 @@ pub fn inspect_existing_onion_layout_v2(
         chunk_header_size,
         &packed_file,
         &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+        total_packed_entries,
         chunk_bins,
         entry_size,
+        chunk_master_seed,
     )?;
     let roots: Vec<Hash256> = index_roots.into_iter().chain(chunk_roots).collect();
     let roots_path = dir.join(ONION_MERKLE_ROOTS_FILENAME);
@@ -2767,8 +2769,10 @@ fn verify_existing_chunk_leaf_hashes(
     header_size: usize,
     packed: &File,
     hashes_path: &Path,
+    total_packed_entries: u32,
     bins_per_table: u32,
     entry_size: u32,
+    master_seed: u64,
 ) -> Result<Vec<Hash256>, PipelineError> {
     let mut hashes = BufReader::new(File::open(hashes_path)?);
     verify_hash_header(&mut hashes, hashes_path, CHUNK_K as u32, bins_per_table)?;
@@ -2777,6 +2781,11 @@ fn verify_existing_chunk_leaf_hashes(
     let mut expected = [0u8; MERKLE_HASH_SIZE];
     let mut id_bytes = [0u8; 4];
     let mut roots = Vec::with_capacity(CHUNK_K);
+    // Each packed entry is deterministically assigned to three distinct
+    // groups. Track those exact assignments so an unreferenced trailing entry,
+    // duplicate placement, wrong group, or impossible cuckoo bin cannot change
+    // the v2 query dimensions while preserving the old Merkle root.
+    let mut placement_masks = vec![0u8; total_packed_entries as usize];
     for group in 0..CHUNK_K {
         let mut leaves = Vec::with_capacity(bins_per_table as usize);
         for bin in 0..bins_per_table as usize {
@@ -2786,6 +2795,36 @@ fn verify_existing_chunk_leaf_hashes(
             let actual = if entry_id == EMPTY {
                 zero_hash
             } else {
+                let mask = placement_masks.get_mut(entry_id as usize).ok_or_else(|| {
+                    PipelineError::InvalidExistingOnionLayout(format!(
+                        "chunk entry id {entry_id} is outside total_packed_entries {total_packed_entries}"
+                    ))
+                })?;
+                let expected_groups = derive_int_groups_3(entry_id, CHUNK_K);
+                let assignment = expected_groups
+                    .iter()
+                    .position(|&expected_group| expected_group == group)
+                    .ok_or_else(|| {
+                        PipelineError::InvalidExistingOnionLayout(format!(
+                            "chunk entry id {entry_id} appears in unexpected group {group}"
+                        ))
+                    })?;
+                let assignment_bit = 1u8 << assignment;
+                if *mask & assignment_bit != 0 {
+                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                        "chunk entry id {entry_id} is duplicated in group {group}"
+                    )));
+                }
+                let valid_bin = (0..ONION_DATA_CUCKOO_HASHES).any(|hash_fn| {
+                    let key = derive_cuckoo_key(master_seed, group, hash_fn);
+                    cuckoo_hash_int(entry_id, key, bins_per_table as usize) == bin
+                });
+                if !valid_bin {
+                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                        "chunk entry id {entry_id} occupies impossible bin {bin} in group {group}"
+                    )));
+                }
+                *mask |= assignment_bit;
                 packed.read_exact_at(&mut entry, entry_id as u64 * entry_size as u64)?;
                 sha256(&entry)
             };
@@ -2798,6 +2837,15 @@ fn verify_existing_chunk_leaf_hashes(
             leaves.push(actual);
         }
         roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
+    }
+    if let Some((entry_id, mask)) = placement_masks
+        .iter()
+        .enumerate()
+        .find(|(_, mask)| **mask != (1u8 << CHUNK_PBC_HASHES) - 1)
+    {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "chunk entry id {entry_id} has incomplete deterministic placements (mask 0b{mask:03b})"
+        )));
     }
     ensure_reader_eof(&mut hashes, hashes_path)?;
     Ok(roots)
@@ -4881,7 +4929,12 @@ mod tests {
             entry_size,
             ..Default::default()
         };
-        let chunk_tables = vec![vec![0, EMPTY]; CHUNK_K];
+        let mut chunk_tables = vec![vec![EMPTY; 2]; CHUNK_K];
+        for group in derive_int_groups_3(0, CHUNK_K) {
+            let key = derive_cuckoo_key(chunk_options.master_seed, group, 0);
+            let bin = cuckoo_hash_int(0, key, 2);
+            chunk_tables[group][bin] = 0;
+        }
         write_onion_data_cuckoo_file(
             &dir.join(ONION_CHUNK_CUCKOO_FILENAME),
             &chunk_tables,
@@ -4914,6 +4967,26 @@ mod tests {
         assert_eq!(layout.entry_size, 64);
         assert_eq!(layout.index_bins_per_table, 2);
         assert_eq!(layout.chunk_bins_per_table, 2);
+
+        // The Merkle root does not cover the packed-entry count in the chunk
+        // header. Inflating that count and appending an unreferenced entry must
+        // therefore be rejected by the deterministic placement audit.
+        let chunk_path = dir.join(ONION_CHUNK_CUCKOO_FILENAME);
+        let original_chunk = std::fs::read(&chunk_path).unwrap();
+        let mut inflated_chunk = original_chunk.clone();
+        inflated_chunk[28..32].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&chunk_path, inflated_chunk).unwrap();
+        let packed_path = dir.join(ONION_PACKED_ENTRIES_FILENAME);
+        let original_packed = std::fs::read(&packed_path).unwrap();
+        let mut inflated_packed = original_packed.clone();
+        inflated_packed.extend_from_slice(&vec![0xa5; entry_size]);
+        std::fs::write(&packed_path, inflated_packed).unwrap();
+        assert!(inspect_existing_onion_layout_v2(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete deterministic placements"));
+        std::fs::write(&chunk_path, original_chunk).unwrap();
+        std::fs::write(&packed_path, original_packed).unwrap();
 
         let mut tampered = std::fs::read(dir.join(ONION_INDEX_BINS_FILENAME)).unwrap();
         tampered[0] ^= 1;

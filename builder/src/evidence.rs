@@ -49,6 +49,7 @@ struct BuildEvidence {
     server_db_manifest_sha256: [u8; 32],
     evidence_mode: u8,
     predecessor_evidence_sha256: Option<[u8; 32]>,
+    predecessor_report_sha256: Option<[u8; 32]>,
     onion_layout_v2: Option<OnionLayoutV2>,
 }
 
@@ -119,6 +120,13 @@ impl BuildEvidence {
                 }
                 None => out.push(0),
             }
+            match self.predecessor_report_sha256 {
+                Some(hash) => {
+                    out.push(1);
+                    put_arr(&mut out, &hash);
+                }
+                None => out.push(0),
+            }
             put_u32(&mut out, layout.total_packed_entries);
             put_u32(&mut out, layout.index_bins_per_table);
             put_u32(&mut out, layout.chunk_bins_per_table);
@@ -161,29 +169,41 @@ impl BuildEvidence {
         let database_manifest_sha256 = take_arr::<32>(cur, "database_manifest_sha256")?;
         let all_artifacts_manifest_sha256 = take_arr::<32>(cur, "all_artifacts_manifest_sha256")?;
         let server_db_manifest_sha256 = take_arr::<32>(cur, "server_db_manifest_sha256")?;
-        let (evidence_mode, predecessor_evidence_sha256, onion_layout_v2) =
-            if version == EVIDENCE_VERSION_V2 {
-                let evidence_mode = take_u8(cur, "evidence_mode")?;
-                if evidence_mode > 1 {
-                    return Err(format!("unknown evidence mode: {evidence_mode}"));
-                }
-                let predecessor = match take_u8(cur, "has_predecessor_evidence")? {
-                    0 => None,
-                    1 => Some(take_arr::<32>(cur, "predecessor_evidence_sha256")?),
-                    _ => return Err("bad predecessor evidence option tag".into()),
-                };
-                let layout = OnionLayoutV2 {
-                    total_packed_entries: take_u32(cur, "onion_total_packed_entries")?,
-                    index_bins_per_table: take_u32(cur, "onion_index_bins_per_table")?,
-                    chunk_bins_per_table: take_u32(cur, "onion_chunk_bins_per_table")?,
-                };
-                if evidence_mode == 1 && predecessor.is_none() {
-                    return Err("reattest_existing evidence requires predecessor digest".into());
-                }
-                (evidence_mode, predecessor, Some(layout))
-            } else {
-                (0, None, None)
+        let (
+            evidence_mode,
+            predecessor_evidence_sha256,
+            predecessor_report_sha256,
+            onion_layout_v2,
+        ) = if version == EVIDENCE_VERSION_V2 {
+            let evidence_mode = take_u8(cur, "evidence_mode")?;
+            if evidence_mode > 1 {
+                return Err(format!("unknown evidence mode: {evidence_mode}"));
+            }
+            let predecessor = match take_u8(cur, "has_predecessor_evidence")? {
+                0 => None,
+                1 => Some(take_arr::<32>(cur, "predecessor_evidence_sha256")?),
+                _ => return Err("bad predecessor evidence option tag".into()),
             };
+            let predecessor_report = match take_u8(cur, "has_predecessor_report")? {
+                0 => None,
+                1 => Some(take_arr::<32>(cur, "predecessor_report_sha256")?),
+                _ => return Err("bad predecessor report option tag".into()),
+            };
+            let layout = OnionLayoutV2 {
+                total_packed_entries: take_u32(cur, "onion_total_packed_entries")?,
+                index_bins_per_table: take_u32(cur, "onion_index_bins_per_table")?,
+                chunk_bins_per_table: take_u32(cur, "onion_chunk_bins_per_table")?,
+            };
+            if evidence_mode == 1 && (predecessor.is_none() || predecessor_report.is_none()) {
+                return Err(
+                    "reattest_existing evidence requires predecessor evidence and report digests"
+                        .into(),
+                );
+            }
+            (evidence_mode, predecessor, predecessor_report, Some(layout))
+        } else {
+            (0, None, None, None)
+        };
         if !cur.is_empty() {
             return Err("trailing bytes in build evidence".into());
         }
@@ -216,6 +236,7 @@ impl BuildEvidence {
             server_db_manifest_sha256,
             evidence_mode,
             predecessor_evidence_sha256,
+            predecessor_report_sha256,
             onion_layout_v2,
         };
         validate_metadata_string("builder_git_commit", &evidence.builder_git_commit)?;
@@ -307,6 +328,7 @@ pub fn write_build_evidence(
             server_db_manifest_sha256,
             evidence_mode: 0,
             predecessor_evidence_sha256: None,
+            predecessor_report_sha256: None,
             onion_layout_v2: None,
         };
         let evidence = evidence.with_layout_from_summary(out_dir)?;
@@ -360,7 +382,8 @@ pub fn attest_existing_layout(
                 predecessor.version
             ));
         }
-        verify_predecessor_proof_directory(predecessor_dir, &predecessor)?;
+        let predecessor_report_sha256 =
+            verify_predecessor_proof_directory(predecessor_dir, &predecessor)?;
 
         let layout = dbpipeline::inspect_existing_onion_layout_v2(artifact_dir)
             .map_err(|e| format!("artifact consistency check failed: {e}"))?;
@@ -444,6 +467,7 @@ pub fn attest_existing_layout(
             server_db_manifest_sha256: sha256_file_32(&out_dir.join("server-db/MANIFEST.toml"))?,
             evidence_mode: 1,
             predecessor_evidence_sha256: Some(sha256_bytes(&predecessor_bytes)),
+            predecessor_report_sha256: Some(predecessor_report_sha256),
             onion_layout_v2: Some(OnionLayoutV2 {
                 total_packed_entries: layout.total_packed_entries,
                 index_bins_per_table: layout.index_bins_per_table,
@@ -474,7 +498,10 @@ pub fn attest_existing_layout(
     }
 }
 
-fn verify_predecessor_proof_directory(dir: &Path, evidence: &BuildEvidence) -> Result<(), String> {
+fn verify_predecessor_proof_directory(
+    dir: &Path,
+    evidence: &BuildEvidence,
+) -> Result<[u8; 32], String> {
     let payload_bytes = fs::read(dir.join("root-bundle-payload.bin"))
         .map_err(|e| format!("failed to read predecessor root payload: {e}"))?;
     expect_eq(
@@ -530,7 +557,7 @@ fn verify_predecessor_proof_directory(dir: &Path, evidence: &BuildEvidence) -> R
     if extract_sev_snp_report_data(&report)? != evidence.report_data()? {
         return Err("predecessor SEV-SNP REPORT_DATA mismatch".into());
     }
-    Ok(())
+    Ok(sha256_bytes(&report))
 }
 
 fn verify_layout_anchor_and_seeds(
@@ -935,6 +962,13 @@ fn print_evidence_report(evidence: &BuildEvidence, evidence_path: Option<&str>) 
             "predecessor_evidence_sha256={}",
             evidence
                 .predecessor_evidence_sha256
+                .map(hex::encode)
+                .unwrap_or_else(|| "none".into())
+        );
+        println!(
+            "predecessor_report_sha256={}",
+            evidence
+                .predecessor_report_sha256
                 .map(hex::encode)
                 .unwrap_or_else(|| "none".into())
         );
@@ -1406,6 +1440,7 @@ mod tests {
             server_db_manifest_sha256: [13u8; 32],
             evidence_mode: 0,
             predecessor_evidence_sha256: None,
+            predecessor_report_sha256: None,
             onion_layout_v2: None,
         }
     }
@@ -1437,6 +1472,7 @@ mod tests {
         evidence.version = EVIDENCE_VERSION_V2;
         evidence.evidence_mode = 1;
         evidence.predecessor_evidence_sha256 = Some([14u8; 32]);
+        evidence.predecessor_report_sha256 = Some([15u8; 32]);
         evidence.onion_layout_v2 = Some(OnionLayoutV2 {
             total_packed_entries: 123,
             index_bins_per_table: 456,
