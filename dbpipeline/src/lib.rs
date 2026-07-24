@@ -2596,7 +2596,7 @@ pub fn inspect_existing_onion_layout_v2(
         return Err(invalid("index and chunk anchors differ".into()));
     }
 
-    let entry_size = inspect_onion_sibling_entry_size(dir)?;
+    let entry_size = inspect_onion_entry_size(dir)?;
     let expected_index_slots = entry_size / ONION_INDEX_SLOT_SIZE as u32;
     if index_slots != expected_index_slots {
         return Err(invalid(format!(
@@ -2648,23 +2648,37 @@ pub fn inspect_existing_onion_layout_v2(
             )
         }
         (false, false) => {
-            // Production retains the final preprocessed serving images rather
-            // than the much larger raw packed/index inputs. Their exact bytes
-            // are added to the v2 root payload by the re-attester. Here we
-            // validate their shape and recover the Merkle roots from the
-            // retained ordered leaf-hash files. Query responses remain bound
-            // to those roots by the client-side Merkle proof.
-            validate_existing_final_serving_artifacts(
-                dir,
-                &anchor_bytes,
-                index_bins,
-                total_packed_entries,
-            )?;
-            verify_existing_chunk_placements(
+            // A full production directory has the final preprocessed serving
+            // images; a compact witness may intentionally omit them. In both
+            // cases, the retained ordered leaf hashes are authenticated by the
+            // predecessor proof's Onion super-root, and the chunk occupancy is
+            // tied to those hashes before the v2-only dimensions are accepted.
+            let final_files = (
+                dir.join(ONION_INDEX_ALL_FILENAME).exists(),
+                dir.join(ONION_SHARED_NTT_FILENAME).exists(),
+            );
+            match final_files {
+                (true, true) => validate_existing_final_serving_artifacts(
+                    dir,
+                    &anchor_bytes,
+                    index_bins,
+                    total_packed_entries,
+                )?,
+                (false, false) => {}
+                _ => {
+                    return Err(invalid(
+                        "onion_index_all.bin and onion_shared_ntt.bin must either both exist or both be absent"
+                            .into(),
+                    ));
+                }
+            }
+            verify_existing_chunk_placements_and_occupancy(
                 &chunk_file,
                 chunk_header_size,
+                &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
                 total_packed_entries,
                 chunk_bins,
+                entry_size,
                 chunk_master_seed,
             )?;
             (
@@ -2743,16 +2757,51 @@ fn onion_anchor_len(magic: u64, base: u64) -> Result<usize, PipelineError> {
     }
 }
 
-fn inspect_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
+fn inspect_onion_entry_size(dir: &Path) -> Result<u32, PipelineError> {
     let raw_index = dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME);
     let raw_data = dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME);
     match (raw_index.exists(), raw_data.exists()) {
         (true, true) => inspect_raw_onion_sibling_entry_size(dir),
-        (false, false) => inspect_preprocessed_onion_sibling_entry_size(dir),
+        (false, false) => {
+            let preprocessed_index = dir.join(ONION_MERKLE_SIB_INDEX_FILENAME);
+            let preprocessed_data = dir.join(ONION_MERKLE_SIB_DATA_FILENAME);
+            match (preprocessed_index.exists(), preprocessed_data.exists()) {
+                (true, true) => inspect_preprocessed_onion_sibling_entry_size(dir),
+                (false, false) => inspect_tree_tops_entry_size(dir),
+                _ => Err(PipelineError::InvalidExistingOnionLayout(
+                    "preprocessed Onion sibling files must either both exist or both be absent"
+                        .into(),
+                )),
+            }
+        }
         _ => Err(PipelineError::InvalidExistingOnionLayout(
             "raw Onion sibling-row files must either both exist or both be absent".into(),
         )),
     }
+}
+
+fn inspect_tree_tops_entry_size(dir: &Path) -> Result<u32, PipelineError> {
+    let path = dir.join(ONION_MERKLE_TREE_TOPS_FILENAME);
+    let data = std::fs::read(&path)?;
+    // [tree_count: u32], followed by the first record whose arity is at
+    // record offset 5. The full parser later verifies every record and root.
+    if data.len() < 12 {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} is too short to recover Onion entry size",
+            path.display()
+        )));
+    }
+    let tree_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let arity = u16::from_le_bytes(data[9..11].try_into().unwrap()) as u32;
+    if tree_count != (INDEX_K + CHUNK_K) as u32 || arity == 0 {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} has invalid tree count or arity",
+            path.display()
+        )));
+    }
+    arity.checked_mul(MERKLE_HASH_SIZE as u32).ok_or_else(|| {
+        PipelineError::InvalidExistingOnionLayout("Onion entry size overflow".into())
+    })
 }
 
 fn inspect_raw_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
@@ -3045,23 +3094,42 @@ fn roots_from_stored_leaf_hashes(
     .collect())
 }
 
-fn verify_existing_chunk_placements(
+fn verify_existing_chunk_placements_and_occupancy(
     cuckoo: &File,
     header_size: usize,
+    hashes_path: &Path,
     total_packed_entries: u32,
     bins_per_table: u32,
+    entry_size: u32,
     master_seed: u64,
 ) -> Result<(), PipelineError> {
     let mut id_bytes = [0u8; 4];
+    let mut hashes = BufReader::new(File::open(hashes_path)?);
+    verify_hash_header(&mut hashes, hashes_path, CHUNK_K as u32, bins_per_table)?;
+    let zero_hash = sha256(&vec![0u8; entry_size as usize]);
+    let mut leaf_hash = [0u8; MERKLE_HASH_SIZE];
     let mut placement_masks = vec![0u8; total_packed_entries as usize];
+    let mut occupied = 0u64;
     for group in 0..CHUNK_K {
         for bin in 0..bins_per_table as usize {
             let ordinal = group * bins_per_table as usize + bin;
             cuckoo.read_exact_at(&mut id_bytes, (header_size + ordinal * 4) as u64)?;
+            hashes.read_exact(&mut leaf_hash)?;
             let entry_id = u32::from_le_bytes(id_bytes);
             if entry_id == EMPTY {
+                if leaf_hash != zero_hash {
+                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                        "empty chunk position has non-empty leaf hash at group {group}, bin {bin}"
+                    )));
+                }
                 continue;
             }
+            if leaf_hash == zero_hash {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "occupied chunk position has empty leaf hash at group {group}, bin {bin}"
+                )));
+            }
+            occupied += 1;
             let mask = placement_masks.get_mut(entry_id as usize).ok_or_else(|| {
                 PipelineError::InvalidExistingOnionLayout(format!(
                     "chunk entry id {entry_id} is outside total_packed_entries {total_packed_entries}"
@@ -3103,6 +3171,13 @@ fn verify_existing_chunk_placements(
             "chunk entry id {entry_id} has incomplete deterministic placements (mask 0b{mask:03b})"
         )));
     }
+    let expected_occupied = total_packed_entries as u64 * CHUNK_PBC_HASHES as u64;
+    if occupied != expected_occupied {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "chunk occupancy {occupied} does not equal total_packed_entries * {CHUNK_PBC_HASHES} ({expected_occupied})"
+        )));
+    }
+    ensure_reader_eof(&mut hashes, hashes_path)?;
     Ok(())
 }
 
@@ -3147,11 +3222,13 @@ fn verify_existing_chunk_leaf_hashes(
     entry_size: u32,
     master_seed: u64,
 ) -> Result<Vec<Hash256>, PipelineError> {
-    verify_existing_chunk_placements(
+    verify_existing_chunk_placements_and_occupancy(
         cuckoo,
         header_size,
+        hashes_path,
         total_packed_entries,
         bins_per_table,
+        entry_size,
         master_seed,
     )?;
     let mut hashes = BufReader::new(File::open(hashes_path)?);
@@ -5391,6 +5468,20 @@ mod tests {
         }
         let retained_layout = inspect_existing_onion_layout_v2(&dir).unwrap();
         assert_eq!(retained_layout, layout);
+
+        // A compact witness needs neither raw tables nor final NTT/INDEX and
+        // sibling serving images. The root-bound leaf hashes, cuckoo mapping,
+        // roots, and tree-tops are sufficient to recover and verify layout.
+        for filename in [
+            ONION_INDEX_ALL_FILENAME,
+            ONION_SHARED_NTT_FILENAME,
+            ONION_MERKLE_SIB_INDEX_FILENAME,
+            ONION_MERKLE_SIB_DATA_FILENAME,
+        ] {
+            std::fs::remove_file(dir.join(filename)).unwrap();
+        }
+        let compact_layout = inspect_existing_onion_layout_v2(&dir).unwrap();
+        assert_eq!(compact_layout, layout);
         let _ = std::fs::remove_dir_all(dir);
     }
 
