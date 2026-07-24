@@ -73,6 +73,10 @@ pub const ONION_DATA_BIN_HASHES_FILENAME: &str = "onion_data_bin_hashes.bin";
 pub const ONION_INDEX_BINS_FILENAME: &str = "onion_index_bins.bin";
 pub const ONION_INDEX_META_FILENAME: &str = "onion_index_meta.bin";
 pub const ONION_INDEX_BIN_HASHES_FILENAME: &str = "onion_index_bin_hashes.bin";
+pub const ONION_SHARED_NTT_FILENAME: &str = "onion_shared_ntt.bin";
+pub const ONION_INDEX_ALL_FILENAME: &str = "onion_index_all.bin";
+pub const ONION_MERKLE_SIB_INDEX_FILENAME: &str = "merkle_onion_sib_index.bin";
+pub const ONION_MERKLE_SIB_DATA_FILENAME: &str = "merkle_onion_sib_data.bin";
 pub const ONION_INDEX_RECORD_SIZE: usize = 20 + 4 + 2 + 1;
 pub const DEFAULT_ONION_ENTRY_SIZE: usize = 3_328;
 pub const ONION_WHALE_FLAG: u8 = 0x40;
@@ -80,6 +84,8 @@ pub const ONION_INDEX_SLOT_SIZE: usize = 8 + 4 + 2 + 1;
 pub const ONION_INDEX_CUCKOO_HASHES: usize = 2;
 pub const ONION_INDEX_META_HEADER_SIZE: usize = 44;
 pub const ONION_INDEX_META_MAGIC: u64 = 0xBA7C_0010_0000_0002;
+pub const ONION_INDEX_ALL_MAGIC: u64 = 0xBA7C_0010_0000_0003;
+pub const ONION_INDEX_ALL_HEADER_SIZE: usize = 32;
 pub const ONION_DATA_CUCKOO_HASHES: usize = 6;
 pub const ONION_DATA_CUCKOO_HEADER_SIZE: usize = 36;
 pub const ONION_DATA_CUCKOO_MAGIC: u64 = 0xBA7C_0010_0000_0001;
@@ -92,6 +98,13 @@ pub const ONION_MERKLE_CACHE_FROM_LEVEL: usize = 1;
 pub const ONION_MERKLE_SIB_ROWS_INDEX_MAGIC: u64 = 0xBA7C_0E52_0000_0000;
 pub const ONION_MERKLE_SIB_ROWS_DATA_MAGIC: u64 = 0xBA7C_0E52_0000_0001;
 pub const ONION_MERKLE_SIB_ROWS_HEADER_SIZE: usize = 24;
+pub const ONION_MERKLE_SIB_INDEX_MAGIC: u64 = 0xBA7C_0E51_0000_0000;
+pub const ONION_MERKLE_SIB_DATA_MAGIC: u64 = 0xBA7C_0E51_0000_0001;
+pub const ONION_MERKLE_SIB_HEADER_SIZE: usize = 24;
+
+const ONION_SAVE_DB_MAGIC: u64 = 0x4F50_4952_5632_5F44;
+const ONION_SAVE_DB_VERSION: u64 = 1;
+const ONION_SAVE_DB_HEADER_SIZE: usize = 48;
 
 const ZERO_PAD: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
 const ZERO_HASH: Hash256 = [0u8; MERKLE_HASH_SIZE];
@@ -2595,40 +2608,88 @@ pub fn inspect_existing_onion_layout_v2(
     }
 
     let packed_path = dir.join(ONION_PACKED_ENTRIES_FILENAME);
-    let packed_file = File::open(&packed_path)?;
-    let expected_packed_bytes = total_packed_entries as u64 * entry_size as u64;
-    if packed_file.metadata()?.len() != expected_packed_bytes {
-        return Err(invalid(format!(
-            "{} length does not match total_packed_entries * entry_size",
-            packed_path.display()
-        )));
-    }
     let index_bins_path = dir.join(ONION_INDEX_BINS_FILENAME);
-    let index_bins_file = File::open(&index_bins_path)?;
-    let expected_index_bytes = INDEX_K as u64 * index_bins as u64 * entry_size as u64;
-    if index_bins_file.metadata()?.len() != expected_index_bytes {
-        return Err(invalid(format!(
-            "{} length does not match index geometry",
-            index_bins_path.display()
-        )));
-    }
-
-    let index_roots = verify_existing_index_leaf_hashes(
-        &index_bins_file,
-        &dir.join(ONION_INDEX_BIN_HASHES_FILENAME),
-        index_bins,
-        entry_size,
-    )?;
-    let chunk_roots = verify_existing_chunk_leaf_hashes(
-        &chunk_file,
-        chunk_header_size,
-        &packed_file,
-        &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
-        total_packed_entries,
-        chunk_bins,
-        entry_size,
-        chunk_master_seed,
-    )?;
+    let raw_files = (packed_path.exists(), index_bins_path.exists());
+    let (index_roots, chunk_roots) = match raw_files {
+        (true, true) => {
+            let packed_file = File::open(&packed_path)?;
+            let expected_packed_bytes = total_packed_entries as u64 * entry_size as u64;
+            if packed_file.metadata()?.len() != expected_packed_bytes {
+                return Err(invalid(format!(
+                    "{} length does not match total_packed_entries * entry_size",
+                    packed_path.display()
+                )));
+            }
+            let index_bins_file = File::open(&index_bins_path)?;
+            let expected_index_bytes = INDEX_K as u64 * index_bins as u64 * entry_size as u64;
+            if index_bins_file.metadata()?.len() != expected_index_bytes {
+                return Err(invalid(format!(
+                    "{} length does not match index geometry",
+                    index_bins_path.display()
+                )));
+            }
+            (
+                verify_existing_index_leaf_hashes(
+                    &index_bins_file,
+                    &dir.join(ONION_INDEX_BIN_HASHES_FILENAME),
+                    index_bins,
+                    entry_size,
+                )?,
+                verify_existing_chunk_leaf_hashes(
+                    &chunk_file,
+                    chunk_header_size,
+                    &packed_file,
+                    &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+                    total_packed_entries,
+                    chunk_bins,
+                    entry_size,
+                    chunk_master_seed,
+                )?,
+            )
+        }
+        (false, false) => {
+            // Production retains the final preprocessed serving images rather
+            // than the much larger raw packed/index inputs. Their exact bytes
+            // are added to the v2 root payload by the re-attester. Here we
+            // validate their shape and recover the Merkle roots from the
+            // retained ordered leaf-hash files. Query responses remain bound
+            // to those roots by the client-side Merkle proof.
+            validate_existing_final_serving_artifacts(
+                dir,
+                &anchor_bytes,
+                index_bins,
+                total_packed_entries,
+            )?;
+            verify_existing_chunk_placements(
+                &chunk_file,
+                chunk_header_size,
+                total_packed_entries,
+                chunk_bins,
+                chunk_master_seed,
+            )?;
+            (
+                roots_from_stored_leaf_hashes(
+                    &dir.join(ONION_INDEX_BIN_HASHES_FILENAME),
+                    INDEX_K,
+                    index_bins,
+                    entry_size,
+                )?,
+                roots_from_stored_leaf_hashes(
+                    &dir.join(ONION_DATA_BIN_HASHES_FILENAME),
+                    CHUNK_K,
+                    chunk_bins,
+                    entry_size,
+                )?,
+            )
+        }
+        _ => {
+            return Err(invalid(format!(
+                "{} and {} must either both exist or both be absent",
+                packed_path.display(),
+                index_bins_path.display()
+            )));
+        }
+    };
     let roots: Vec<Hash256> = index_roots.into_iter().chain(chunk_roots).collect();
     let roots_path = dir.join(ONION_MERKLE_ROOTS_FILENAME);
     let roots_bytes = std::fs::read(&roots_path)?;
@@ -2683,6 +2744,18 @@ fn onion_anchor_len(magic: u64, base: u64) -> Result<usize, PipelineError> {
 }
 
 fn inspect_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
+    let raw_index = dir.join(ONION_MERKLE_SIB_ROWS_INDEX_FILENAME);
+    let raw_data = dir.join(ONION_MERKLE_SIB_ROWS_DATA_FILENAME);
+    match (raw_index.exists(), raw_data.exists()) {
+        (true, true) => inspect_raw_onion_sibling_entry_size(dir),
+        (false, false) => inspect_preprocessed_onion_sibling_entry_size(dir),
+        _ => Err(PipelineError::InvalidExistingOnionLayout(
+            "raw Onion sibling-row files must either both exist or both be absent".into(),
+        )),
+    }
+}
+
+fn inspect_raw_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
     let mut sizes = Vec::new();
     for (filename, magic, k) in [
         (
@@ -2732,6 +2805,307 @@ fn inspect_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
     Ok(sizes[0])
 }
 
+fn inspect_preprocessed_onion_sibling_entry_size(dir: &Path) -> Result<u32, PipelineError> {
+    let mut sizes = Vec::new();
+    for (filename, magic, k) in [
+        (
+            ONION_MERKLE_SIB_INDEX_FILENAME,
+            ONION_MERKLE_SIB_INDEX_MAGIC,
+            INDEX_K as u32,
+        ),
+        (
+            ONION_MERKLE_SIB_DATA_FILENAME,
+            ONION_MERKLE_SIB_DATA_MAGIC,
+            CHUNK_K as u32,
+        ),
+    ] {
+        let path = dir.join(filename);
+        let file = File::open(&path)?;
+        let mut header = [0u8; ONION_MERKLE_SIB_HEADER_SIZE];
+        file.read_exact_at(&mut header, 0)?;
+        let actual_magic = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let actual_k = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let arity = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let rows = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let blob_len = u32::from_le_bytes(header[20..24].try_into().unwrap());
+        let expected_len = ONION_MERKLE_SIB_HEADER_SIZE as u64 + actual_k as u64 * blob_len as u64;
+        if actual_magic != magic
+            || actual_k != k
+            || arity == 0
+            || rows == 0
+            || blob_len < ONION_SAVE_DB_HEADER_SIZE as u32
+            || file.metadata()?.len() != expected_len
+        {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "bad preprocessed sibling header or length in {}",
+                path.display()
+            )));
+        }
+        for group in 0..actual_k as usize {
+            let offset = ONION_MERKLE_SIB_HEADER_SIZE as u64 + group as u64 * blob_len as u64;
+            let save = read_save_db_header(&file, offset, &path)?;
+            validate_save_db_header(&save, Some(rows as u64), blob_len as u64, &path)?;
+        }
+        sizes.push(arity * MERKLE_HASH_SIZE as u32);
+    }
+    if sizes[0] != sizes[1] {
+        return Err(PipelineError::InvalidExistingOnionLayout(
+            "index and chunk preprocessed sibling arities differ".into(),
+        ));
+    }
+    Ok(sizes[0])
+}
+
+fn read_save_db_header(file: &File, offset: u64, path: &Path) -> Result<[u64; 6], PipelineError> {
+    let mut bytes = [0u8; ONION_SAVE_DB_HEADER_SIZE];
+    file.read_exact_at(&mut bytes, offset)?;
+    let mut words = [0u64; 6];
+    for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(8)) {
+        *word = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    if words[0] != ONION_SAVE_DB_MAGIC || words[1] != ONION_SAVE_DB_VERSION {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} has an unknown Onion save-db header",
+            path.display()
+        )));
+    }
+    Ok(words)
+}
+
+fn validate_save_db_header(
+    header: &[u64; 6],
+    expected_num_pt: Option<u64>,
+    blob_len: u64,
+    path: &Path,
+) -> Result<(), PipelineError> {
+    let layout = header[2];
+    let num_pt = header[3];
+    let coeff_val_cnt = header[4];
+    let data_bytes = header[5];
+    if layout > 3 || num_pt == 0 || coeff_val_cnt == 0 {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} has invalid save-db geometry",
+            path.display()
+        )));
+    }
+    if let Some(expected) = expected_num_pt {
+        if num_pt != expected {
+            return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                "{} save-db num_pt {num_pt} does not equal expected {expected}",
+                path.display()
+            )));
+        }
+    }
+    let coefficient_bytes = if layout & 1 != 0 || layout & 2 != 0 {
+        4u64
+    } else {
+        8u64
+    };
+    let planes = if layout & 1 != 0 { 2u64 } else { 1u64 };
+    let expected_data = num_pt
+        .checked_mul(coeff_val_cnt)
+        .and_then(|n| n.checked_mul(coefficient_bytes))
+        .and_then(|n| n.checked_mul(planes))
+        .ok_or_else(|| {
+            PipelineError::InvalidExistingOnionLayout(format!(
+                "{} save-db length overflow",
+                path.display()
+            ))
+        })?;
+    if data_bytes != expected_data || blob_len != ONION_SAVE_DB_HEADER_SIZE as u64 + data_bytes {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} save-db payload length does not match its header",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_final_serving_artifacts(
+    dir: &Path,
+    anchor_bytes: &[u8],
+    index_bins: u32,
+    total_packed_entries: u32,
+) -> Result<(), PipelineError> {
+    let invalid = |message: String| PipelineError::InvalidExistingOnionLayout(message);
+    let index_all_path = dir.join(ONION_INDEX_ALL_FILENAME);
+    let index_all = File::open(&index_all_path)?;
+    let mut master = [0u8; ONION_INDEX_ALL_HEADER_SIZE];
+    index_all.read_exact_at(&mut master, 0)?;
+    let magic = u64::from_le_bytes(master[0..8].try_into().unwrap());
+    let k = u64::from_le_bytes(master[8..16].try_into().unwrap());
+    let per_group = u64::from_le_bytes(master[16..24].try_into().unwrap());
+    let reserved = u64::from_le_bytes(master[24..32].try_into().unwrap());
+    let anchor_xor = match anchor_bytes.len() {
+        0 => 0,
+        CHAIN_ANCHOR_BYTES => ANCHOR_MAGIC_SNAPSHOT_XOR,
+        DELTA_ANCHOR_BYTES => ANCHOR_MAGIC_DELTA_XOR,
+        n => return Err(invalid(format!("unsupported Onion anchor length {n}"))),
+    };
+    if magic != (ONION_INDEX_ALL_MAGIC ^ anchor_xor)
+        || k != INDEX_K as u64
+        || per_group < ONION_SAVE_DB_HEADER_SIZE as u64
+        || reserved != 0
+    {
+        return Err(invalid(format!(
+            "{} has an invalid master header",
+            index_all_path.display()
+        )));
+    }
+    let expected_len = (ONION_INDEX_ALL_HEADER_SIZE as u64)
+        .checked_add(
+            k.checked_mul(per_group)
+                .ok_or_else(|| invalid("index-all size overflow".into()))?,
+        )
+        .and_then(|n| n.checked_add(anchor_bytes.len() as u64))
+        .ok_or_else(|| invalid("index-all size overflow".into()))?;
+    if index_all.metadata()?.len() != expected_len {
+        return Err(invalid(format!(
+            "{} length does not match its master header",
+            index_all_path.display()
+        )));
+    }
+    let mut canonical_header = None;
+    for group in 0..INDEX_K {
+        let offset = ONION_INDEX_ALL_HEADER_SIZE as u64 + group as u64 * per_group;
+        let header = read_save_db_header(&index_all, offset, &index_all_path)?;
+        validate_save_db_header(&header, None, per_group, &index_all_path)?;
+        if header[2] != 0 || header[3] < index_bins as u64 {
+            return Err(invalid(format!(
+                "{} group {group} has unsupported layout or insufficient num_pt",
+                index_all_path.display()
+            )));
+        }
+        if let Some(expected) = canonical_header {
+            if header != expected {
+                return Err(invalid(format!(
+                    "{} group {group} header differs from group 0",
+                    index_all_path.display()
+                )));
+            }
+        } else {
+            canonical_header = Some(header);
+        }
+    }
+    let mut actual_anchor = vec![0u8; anchor_bytes.len()];
+    index_all.read_exact_at(
+        &mut actual_anchor,
+        ONION_INDEX_ALL_HEADER_SIZE as u64 + k * per_group,
+    )?;
+    if actual_anchor != anchor_bytes {
+        return Err(invalid(format!(
+            "{} anchor trailer differs from index metadata",
+            index_all_path.display()
+        )));
+    }
+
+    let coeff_val_cnt = canonical_header.unwrap()[4];
+    let ntt_path = dir.join(ONION_SHARED_NTT_FILENAME);
+    let ntt_bytes = File::open(&ntt_path)?.metadata()?.len();
+    let bytes_per_plaintext = coeff_val_cnt
+        .checked_mul(8)
+        .ok_or_else(|| invalid("shared NTT geometry overflow".into()))?;
+    if ntt_bytes == 0 || ntt_bytes % bytes_per_plaintext != 0 {
+        return Err(invalid(format!(
+            "{} length is not an integral Onion plaintext store",
+            ntt_path.display()
+        )));
+    }
+    let shared_num_pt = ntt_bytes / bytes_per_plaintext;
+    if shared_num_pt < total_packed_entries as u64 {
+        return Err(invalid(format!(
+            "{} has {shared_num_pt} plaintexts for {total_packed_entries} packed entries",
+            ntt_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn roots_from_stored_leaf_hashes(
+    path: &Path,
+    expected_k: usize,
+    expected_bins: u32,
+    entry_size: u32,
+) -> Result<Vec<Hash256>, PipelineError> {
+    let stored = read_onion_bin_hashes(path)?;
+    if stored.k != expected_k || stored.bins_per_table != expected_bins as usize {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "{} geometry disagrees with Onion metadata",
+            path.display()
+        )));
+    }
+    Ok(build_onion_tree_kind(
+        stored.k,
+        stored.bins_per_table,
+        &stored.hashes,
+        entry_size as usize / MERKLE_HASH_SIZE,
+    )
+    .into_iter()
+    .map(|tree| tree.root)
+    .collect())
+}
+
+fn verify_existing_chunk_placements(
+    cuckoo: &File,
+    header_size: usize,
+    total_packed_entries: u32,
+    bins_per_table: u32,
+    master_seed: u64,
+) -> Result<(), PipelineError> {
+    let mut id_bytes = [0u8; 4];
+    let mut placement_masks = vec![0u8; total_packed_entries as usize];
+    for group in 0..CHUNK_K {
+        for bin in 0..bins_per_table as usize {
+            let ordinal = group * bins_per_table as usize + bin;
+            cuckoo.read_exact_at(&mut id_bytes, (header_size + ordinal * 4) as u64)?;
+            let entry_id = u32::from_le_bytes(id_bytes);
+            if entry_id == EMPTY {
+                continue;
+            }
+            let mask = placement_masks.get_mut(entry_id as usize).ok_or_else(|| {
+                PipelineError::InvalidExistingOnionLayout(format!(
+                    "chunk entry id {entry_id} is outside total_packed_entries {total_packed_entries}"
+                ))
+            })?;
+            let expected_groups = derive_int_groups_3(entry_id, CHUNK_K);
+            let assignment = expected_groups
+                .iter()
+                .position(|&expected_group| expected_group == group)
+                .ok_or_else(|| {
+                    PipelineError::InvalidExistingOnionLayout(format!(
+                        "chunk entry id {entry_id} appears in unexpected group {group}"
+                    ))
+                })?;
+            let assignment_bit = 1u8 << assignment;
+            if *mask & assignment_bit != 0 {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "chunk entry id {entry_id} is duplicated in group {group}"
+                )));
+            }
+            let valid_bin = (0..ONION_DATA_CUCKOO_HASHES).any(|hash_fn| {
+                let key = derive_cuckoo_key(master_seed, group, hash_fn);
+                cuckoo_hash_int(entry_id, key, bins_per_table as usize) == bin
+            });
+            if !valid_bin {
+                return Err(PipelineError::InvalidExistingOnionLayout(format!(
+                    "chunk entry id {entry_id} occupies impossible bin {bin} in group {group}"
+                )));
+            }
+            *mask |= assignment_bit;
+        }
+    }
+    if let Some((entry_id, mask)) = placement_masks
+        .iter()
+        .enumerate()
+        .find(|(_, mask)| **mask != (1u8 << CHUNK_PBC_HASHES) - 1)
+    {
+        return Err(PipelineError::InvalidExistingOnionLayout(format!(
+            "chunk entry id {entry_id} has incomplete deterministic placements (mask 0b{mask:03b})"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_existing_index_leaf_hashes(
     bins: &File,
     hashes_path: &Path,
@@ -2773,6 +3147,13 @@ fn verify_existing_chunk_leaf_hashes(
     entry_size: u32,
     master_seed: u64,
 ) -> Result<Vec<Hash256>, PipelineError> {
+    verify_existing_chunk_placements(
+        cuckoo,
+        header_size,
+        total_packed_entries,
+        bins_per_table,
+        master_seed,
+    )?;
     let mut hashes = BufReader::new(File::open(hashes_path)?);
     verify_hash_header(&mut hashes, hashes_path, CHUNK_K as u32, bins_per_table)?;
     let mut entry = vec![0u8; entry_size as usize];
@@ -2780,11 +3161,6 @@ fn verify_existing_chunk_leaf_hashes(
     let mut expected = [0u8; MERKLE_HASH_SIZE];
     let mut id_bytes = [0u8; 4];
     let mut roots = Vec::with_capacity(CHUNK_K);
-    // Each packed entry is deterministically assigned to three distinct
-    // groups. Track those exact assignments so an unreferenced trailing entry,
-    // duplicate placement, wrong group, or impossible cuckoo bin cannot change
-    // the v2 query dimensions while preserving the old Merkle root.
-    let mut placement_masks = vec![0u8; total_packed_entries as usize];
     for group in 0..CHUNK_K {
         let mut leaves = Vec::with_capacity(bins_per_table as usize);
         for bin in 0..bins_per_table as usize {
@@ -2794,37 +3170,18 @@ fn verify_existing_chunk_leaf_hashes(
             let actual = if entry_id == EMPTY {
                 zero_hash
             } else {
-                let mask = placement_masks.get_mut(entry_id as usize).ok_or_else(|| {
-                    PipelineError::InvalidExistingOnionLayout(format!(
+                if entry_id >= total_packed_entries {
+                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
                         "chunk entry id {entry_id} is outside total_packed_entries {total_packed_entries}"
-                    ))
-                })?;
-                let expected_groups = derive_int_groups_3(entry_id, CHUNK_K);
-                let assignment = expected_groups
-                    .iter()
-                    .position(|&expected_group| expected_group == group)
-                    .ok_or_else(|| {
+                    )));
+                }
+                packed
+                    .read_exact_at(&mut entry, entry_id as u64 * entry_size as u64)
+                    .map_err(|e| {
                         PipelineError::InvalidExistingOnionLayout(format!(
-                            "chunk entry id {entry_id} appears in unexpected group {group}"
+                            "failed to read packed entry {entry_id}: {e}"
                         ))
                     })?;
-                let assignment_bit = 1u8 << assignment;
-                if *mask & assignment_bit != 0 {
-                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
-                        "chunk entry id {entry_id} is duplicated in group {group}"
-                    )));
-                }
-                let valid_bin = (0..ONION_DATA_CUCKOO_HASHES).any(|hash_fn| {
-                    let key = derive_cuckoo_key(master_seed, group, hash_fn);
-                    cuckoo_hash_int(entry_id, key, bins_per_table as usize) == bin
-                });
-                if !valid_bin {
-                    return Err(PipelineError::InvalidExistingOnionLayout(format!(
-                        "chunk entry id {entry_id} occupies impossible bin {bin} in group {group}"
-                    )));
-                }
-                *mask |= assignment_bit;
-                packed.read_exact_at(&mut entry, entry_id as u64 * entry_size as u64)?;
                 sha256(&entry)
             };
             hashes.read_exact(&mut expected)?;
@@ -2836,15 +3193,6 @@ fn verify_existing_chunk_leaf_hashes(
             leaves.push(actual);
         }
         roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
-    }
-    if let Some((entry_id, mask)) = placement_masks
-        .iter()
-        .enumerate()
-        .find(|(_, mask)| **mask != (1u8 << CHUNK_PBC_HASHES) - 1)
-    {
-        return Err(PipelineError::InvalidExistingOnionLayout(format!(
-            "chunk entry id {entry_id} has incomplete deterministic placements (mask 0b{mask:03b})"
-        )));
     }
     ensure_reader_eof(&mut hashes, hashes_path)?;
     Ok(roots)
@@ -5008,7 +5356,102 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("index leaf hash mismatch"));
+
+        // Production keeps the preprocessed serving images but deletes the
+        // raw packed/index/sibling-row inputs. The same layout must remain
+        // recoverable from the final files plus ordered Merkle leaf hashes.
+        std::fs::write(
+            dir.join(ONION_INDEX_BINS_FILENAME),
+            index_bin.repeat(INDEX_K * 2),
+        )
+        .unwrap();
+        write_test_index_all(&dir, 2, 1, &[]);
+        std::fs::write(dir.join(ONION_SHARED_NTT_FILENAME), [0u8; 8]).unwrap();
+        write_test_preprocessed_sibling(
+            &dir,
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_INDEX_FILENAME,
+            ONION_MERKLE_SIB_INDEX_MAGIC,
+            INDEX_K,
+        );
+        write_test_preprocessed_sibling(
+            &dir,
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
+            ONION_MERKLE_SIB_DATA_FILENAME,
+            ONION_MERKLE_SIB_DATA_MAGIC,
+            CHUNK_K,
+        );
+        for filename in [
+            ONION_PACKED_ENTRIES_FILENAME,
+            ONION_INDEX_BINS_FILENAME,
+            ONION_MERKLE_SIB_ROWS_INDEX_FILENAME,
+            ONION_MERKLE_SIB_ROWS_DATA_FILENAME,
+        ] {
+            std::fs::remove_file(dir.join(filename)).unwrap();
+        }
+        let retained_layout = inspect_existing_onion_layout_v2(&dir).unwrap();
+        assert_eq!(retained_layout, layout);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn test_save_db_blob(num_pt: u64, coeff_val_cnt: u64) -> Vec<u8> {
+        let data_bytes = num_pt * coeff_val_cnt * 8;
+        let mut blob = Vec::with_capacity(ONION_SAVE_DB_HEADER_SIZE + data_bytes as usize);
+        for word in [
+            ONION_SAVE_DB_MAGIC,
+            ONION_SAVE_DB_VERSION,
+            0,
+            num_pt,
+            coeff_val_cnt,
+            data_bytes,
+        ] {
+            blob.extend_from_slice(&word.to_le_bytes());
+        }
+        blob.resize(ONION_SAVE_DB_HEADER_SIZE + data_bytes as usize, 0);
+        blob
+    }
+
+    fn write_test_index_all(dir: &Path, bins: u32, coeff_val_cnt: u64, anchor: &[u8]) {
+        let blob = test_save_db_blob(bins as u64, coeff_val_cnt);
+        let anchor_xor = match anchor.len() {
+            0 => 0,
+            CHAIN_ANCHOR_BYTES => ANCHOR_MAGIC_SNAPSHOT_XOR,
+            DELTA_ANCHOR_BYTES => ANCHOR_MAGIC_DELTA_XOR,
+            _ => panic!("bad test anchor"),
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&(ONION_INDEX_ALL_MAGIC ^ anchor_xor).to_le_bytes());
+        out.extend_from_slice(&(INDEX_K as u64).to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        for _ in 0..INDEX_K {
+            out.extend_from_slice(&blob);
+        }
+        out.extend_from_slice(anchor);
+        std::fs::write(dir.join(ONION_INDEX_ALL_FILENAME), out).unwrap();
+    }
+
+    fn write_test_preprocessed_sibling(
+        dir: &Path,
+        raw_filename: &str,
+        output_filename: &str,
+        magic: u64,
+        k: usize,
+    ) {
+        let raw = std::fs::read(dir.join(raw_filename)).unwrap();
+        let arity = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+        let rows = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+        let blob = test_save_db_blob(rows as u64, 1);
+        let mut out = Vec::new();
+        out.extend_from_slice(&magic.to_le_bytes());
+        out.extend_from_slice(&(k as u32).to_le_bytes());
+        out.extend_from_slice(&arity.to_le_bytes());
+        out.extend_from_slice(&rows.to_le_bytes());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        for _ in 0..k {
+            out.extend_from_slice(&blob);
+        }
+        std::fs::write(dir.join(output_filename), out).unwrap();
     }
 
     fn hash_from_hex(s: &str) -> Hash256 {
