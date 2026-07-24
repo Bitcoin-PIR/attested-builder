@@ -112,6 +112,15 @@ impl BuildEvidence {
             let layout = self
                 .onion_layout_v2
                 .ok_or("v2 evidence missing Onion layout")?;
+            if self.evidence_mode == 1
+                && (self.predecessor_evidence_sha256.is_none()
+                    || self.predecessor_report_sha256.is_none())
+            {
+                return Err(
+                    "reattest_existing evidence requires predecessor evidence and report digests"
+                        .into(),
+                );
+            }
             out.push(self.evidence_mode);
             match self.predecessor_evidence_sha256 {
                 Some(hash) => {
