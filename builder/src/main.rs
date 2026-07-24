@@ -75,6 +75,9 @@ fn main() -> ExitCode {
         Some("write-build-evidence") if args.len() == 10 => evidence::write_build_evidence(
             &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
         ),
+        Some("attest-existing-layout") if args.len() == 10 => evidence::attest_existing_layout(
+            &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
+        ),
         Some("inspect-build-evidence") if args.len() == 3 => {
             evidence::inspect_build_evidence(&args[2])
         }
@@ -248,6 +251,7 @@ fn usage(bin: &str) {
   {bin} build-delta-root-bundle-payload <out-dir> <network-magic-hex> <delta_anchor.bin> <from-muhash-display-hex> <to-muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} write-build-receipt <signed-root-bundle.bin> <snapshot.dat> <core-version> <out-receipt.txt>\n\
   {bin} write-build-evidence <out-dir> <snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
+  {bin} attest-existing-layout <v1-proof-dir> <artifact-dir> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <issued-at-unix> <out-v2-proof-dir>\n\
   {bin} inspect-build-evidence <build-evidence.bin>\n\
   {bin} verify-build-evidence <build-evidence.bin> [--snapshot <snapshot.dat>] [--builder-bin <path>] [--payload <root-bundle-payload.bin>] [--database-manifest <path>] [--all-artifacts-manifest <path>] [--server-db-manifest <path>] [--expected-muhash <hex>] [--expected-anchor-height <height>] [--expected-anchor-hash <hex>] [--expected-report-data <64-byte-hex>] [--sev-snp-report <report.bin>]\n\
   {bin} write-tee-report-data <build-evidence.bin> <out-report-data.bin>\n\
@@ -995,11 +999,13 @@ mod tests {
 
     #[test]
     fn parse_optional_anchor_returns_none_when_no_extra_args() {
-        let argv = args(&["pir-attested-builder", "build-index-cuckoo", "in.bin", "out.bin"]);
-        assert!(matches!(
-            parse_optional_anchor(&argv, 4),
-            Ok(None)
-        ));
+        let argv = args(&[
+            "pir-attested-builder",
+            "build-index-cuckoo",
+            "in.bin",
+            "out.bin",
+        ]);
+        assert!(matches!(parse_optional_anchor(&argv, 4), Ok(None)));
     }
 
     #[test]
@@ -1071,8 +1077,8 @@ mod tests {
     #[test]
     fn parse_entry_size_and_root_only_accepts_entry_size_then_root_only() {
         let argv = args(&["42", "--root-only"]);
-        let (size, root_only) =
-            parse_entry_size_and_root_only(&argv, 3_328).expect("entry-size+root-only should parse");
+        let (size, root_only) = parse_entry_size_and_root_only(&argv, 3_328)
+            .expect("entry-size+root-only should parse");
         assert_eq!(size, 42);
         assert!(root_only);
     }
