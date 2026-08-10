@@ -189,6 +189,8 @@ run_once() {
 cd "$REPO_ROOT"
 cargo build -q -p pir-attested-builder
 BIN=${BIN:-"$REPO_ROOT/target/debug/pir-attested-builder"}
+cargo build -q -p onionffi --features ffi
+ONIONFFI_BIN=${ONIONFFI_BIN:-"$REPO_ROOT/target/debug/onionffi"}
 
 mkdir -p "$WORK" "$LOG_DIR"
 printf '# deterministic local-regtest-e2e test key\nsecret_seed_hex=%s\n' "$TEST_BUILDER_SEED_HEX" > "$KEY_FILE"
@@ -219,6 +221,87 @@ assert_eq "bundle_sha256" "$EXPECTED_BUNDLE_SHA256" "$bundle_sha256"
 assert_eq "receipt_sha256" "$EXPECTED_RECEIPT_SHA256" "$receipt_sha256"
 assert_eq "manifest_sha256" "$EXPECTED_MANIFEST_SHA256" "$manifest_sha256"
 
+# Native full-build v2: exercise the snapshot wrapper rather than
+# reattest-existing.  A host fixture has no SEV device, so this checks the
+# complete staging layout and evidence binding up to (but not including) the
+# platform quote generated in a measured builder.
+V2_DIR="$WORK/full-build-v2"
+SNAPSHOT="$FIXTURE" \
+EXPECTED_MUHASH="$EXPECTED_MUHASH" \
+NETWORK_MAGIC="$NETWORK_MAGIC" \
+ANCHOR_HEIGHT="$ANCHOR_HEIGHT" \
+CORE_VERSION="$CORE_VERSION" \
+ONION_ENTRY_SIZE="$ONION_ENTRY_SIZE" \
+ISSUED_AT="$ISSUED_AT" \
+PARTITIONS="$PARTITIONS" \
+OUT_DIR="$V2_DIR" \
+BIN="$BIN" \
+SKIP_CARGO_BUILD=1 \
+RUN_ONION_FFI=1 \
+ONIONFFI_BIN="$ONIONFFI_BIN" \
+WRITE_RECEIPT=0 \
+EMIT_SEV_SNP_QUOTE=0 \
+BUILD_EVIDENCE_VERSION=2 \
+"$REPO_ROOT/scripts/build-snapshot-database.sh" > "$LOG_DIR/full-build-v2.out"
+
+for rel in \
+    root-bundle-payload.bin \
+    build-evidence.bin \
+    build-evidence.report-data \
+    database.manifest.sha256 \
+    all-artifacts.manifest.sha256 \
+    server-db/MANIFEST.toml \
+    oram-direct-inputs/utxo_chunks_index_nodust.bin \
+    oram-direct-inputs/utxo_chunks_nodust.bin \
+    oram-direct-inputs/direct-inputs.sha256; do
+    [[ -s "$V2_DIR/$rel" ]] || {
+        printf 'error: native full-build v2 missing required staging artifact: %s\n' "$rel" >&2
+        exit 1
+    }
+done
+
+V2_EVIDENCE_LOG="$V2_DIR/logs/15-write-build-evidence.out"
+grep -qx 'evidence_version=2' "$V2_EVIDENCE_LOG"
+grep -qx 'evidence_mode=full_build' "$V2_EVIDENCE_LOG"
+grep -qx 'predecessor_evidence_sha256=none' "$V2_EVIDENCE_LOG"
+grep -qx 'predecessor_report_sha256=none' "$V2_EVIDENCE_LOG"
+
+index_hash=$(hash_one "$V2_DIR/oram-direct-inputs/utxo_chunks_index_nodust.bin")
+chunk_hash=$(hash_one "$V2_DIR/oram-direct-inputs/utxo_chunks_nodust.bin")
+grep -qx "$index_hash  utxo_chunks_index_nodust.bin" "$V2_DIR/oram-direct-inputs/direct-inputs.sha256"
+grep -qx "$chunk_hash  utxo_chunks_nodust.bin" "$V2_DIR/oram-direct-inputs/direct-inputs.sha256"
+grep -qx "index_sha256 = \"$index_hash\"" "$V2_DIR/server-db/MANIFEST.toml"
+grep -qx "chunk_sha256 = \"$chunk_hash\"" "$V2_DIR/server-db/MANIFEST.toml"
+index_records=$(($(wc -c < "$V2_DIR/oram-direct-inputs/utxo_chunks_index_nodust.bin") / 25))
+chunk_records=$(($(wc -c < "$V2_DIR/oram-direct-inputs/utxo_chunks_nodust.bin") / 40))
+grep -qx "index_records = $index_records" "$V2_DIR/server-db/MANIFEST.toml"
+grep -qx "chunk_records = $chunk_records" "$V2_DIR/server-db/MANIFEST.toml"
+
+run_builder verify-build-evidence \
+    "$V2_DIR/build-evidence.bin" \
+    --snapshot "$FIXTURE" \
+    --builder-bin "$BIN" \
+    --payload "$V2_DIR/root-bundle-payload.bin" \
+    --database-manifest "$V2_DIR/database.manifest.sha256" \
+    --all-artifacts-manifest "$V2_DIR/all-artifacts.manifest.sha256" \
+    --server-db-manifest "$V2_DIR/server-db/MANIFEST.toml" \
+    > "$LOG_DIR/full-build-v2.verify-evidence.out"
+
+if SNAPSHOT="$FIXTURE" \
+    EXPECTED_MUHASH="$EXPECTED_MUHASH" \
+    NETWORK_MAGIC="$NETWORK_MAGIC" \
+    ANCHOR_HEIGHT="$ANCHOR_HEIGHT" \
+    OUT_DIR="$WORK/rejected-roots-only-v2" \
+    BIN="$BIN" \
+    SKIP_CARGO_BUILD=1 \
+    ROOTS_ONLY=1 \
+    BUILD_EVIDENCE_VERSION=2 \
+    "$REPO_ROOT/scripts/build-snapshot-database.sh" > "$LOG_DIR/rejected-roots-only-v2.out" 2>&1; then
+    printf 'error: roots-only mode must not claim native full-build v2 evidence\n' >&2
+    exit 1
+fi
+grep -q 'BUILD_EVIDENCE_VERSION=2 requires a full snapshot build' "$LOG_DIR/rejected-roots-only-v2.out"
+
 printf 'status=ok\n'
 printf 'fixture=%s\n' "$FIXTURE"
 printf 'muhash=%s\n' "$EXPECTED_MUHASH"
@@ -230,3 +313,4 @@ printf 'payload_sha256=%s\n' "$payload_sha256"
 printf 'bundle_sha256=%s\n' "$bundle_sha256"
 printf 'receipt_sha256=%s\n' "$receipt_sha256"
 printf 'manifest_sha256=%s\n' "$manifest_sha256"
+printf 'native_full_build_v2=%s\n' "$V2_DIR"

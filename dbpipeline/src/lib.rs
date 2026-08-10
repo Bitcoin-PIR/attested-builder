@@ -3377,6 +3377,13 @@ fn verify_existing_tree_tops(
             seen_nodes += count;
             expected_count = count.div_ceil(arity);
         }
+        // A one-bin tree has no level at or above CACHE_FROM_LEVEL. The
+        // writer encodes an empty cache; its root is already bound by the
+        // verified ordered roots file rather than repeated here.
+        let cache_before_root = levels == 0 && total_nodes == 0 && expected_count == 1;
+        if cache_before_root {
+            last_root = Some(*root);
+        }
         if seen_nodes != total_nodes || last_root.as_ref() != Some(root) || expected_count != 1 {
             return Err(PipelineError::InvalidExistingOnionLayout(format!(
                 "tree-top record {tree} totals or root mismatch"
@@ -5314,6 +5321,29 @@ mod tests {
         assert!(!merkle_anchor_root_only
             .join(MERKLE_BUCKET_ROOTS_FILENAME)
             .exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_onion_layout_v2_accepts_only_empty_single_bin_tree_tops() {
+        let dir = fresh_temp_dir("existing-onion-v2-empty-tree-top");
+        let path = dir.join(ONION_MERKLE_TREE_TOPS_FILENAME);
+        let roots = vec![[0xa5u8; MERKLE_HASH_SIZE]; INDEX_K + CHUNK_K];
+        let mut valid = Vec::new();
+        valid.extend_from_slice(&((INDEX_K + CHUNK_K) as u32).to_le_bytes());
+        for _ in &roots {
+            valid.push(ONION_MERKLE_CACHE_FROM_LEVEL as u8);
+            valid.extend_from_slice(&0u32.to_le_bytes());
+            valid.extend_from_slice(&104u16.to_le_bytes());
+            valid.push(0);
+        }
+        std::fs::write(&path, &valid).unwrap();
+        verify_existing_tree_tops(&path, &roots, 1, 1, 104).unwrap();
+
+        let mut malformed = valid;
+        malformed[5] = 1; // total_nodes=1 with no cached levels is invalid.
+        std::fs::write(&path, malformed).unwrap();
+        assert!(verify_existing_tree_tops(&path, &roots, 1, 1, 104).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -34,6 +34,8 @@
 #                     it does not stage a server-loadable DB. Default 0.
 #   WRITE_BUILD_EVIDENCE 1 to write canonical build-evidence.bin and
 #                     build-evidence.report-data. Default 1.
+#   BUILD_EVIDENCE_VERSION 1 for the legacy roots-only/v1-compatible path;
+#                     2 for a native full-build v2 snapshot (default 1).
 #   BUILDER_GIT_COMMIT   Builder source revision to record. Default current git
 #                     HEAD with "-dirty" suffix if tracked files differ.
 #   TEE_PLATFORM      Evidence-only platform label, e.g. none, sev-snp, tdx.
@@ -362,6 +364,68 @@ stage_server_db() {
     write_server_db_manifest "$server_dir"
 }
 
+stage_direct_oram_inputs() {
+    local out_dir=$1
+    local server_dir=$2
+    local direct_dir="$out_dir/oram-direct-inputs"
+    local index_src="$out_dir/utxo_chunks_index_nodust.bin"
+    local chunk_src="$out_dir/utxo_chunks_nodust.bin"
+    local index_bytes chunk_bytes index_records chunk_records
+
+    [[ -f "$index_src" ]] || fail "Direct ORAM source missing: $index_src"
+    [[ -f "$chunk_src" ]] || fail "Direct ORAM source missing: $chunk_src"
+    [[ ! -e "$direct_dir" ]] || fail "Direct ORAM staging dir already exists: $direct_dir"
+    mkdir -p "$direct_dir"
+    link_or_copy "$index_src" "$direct_dir/utxo_chunks_index_nodust.bin"
+    link_or_copy "$chunk_src" "$direct_dir/utxo_chunks_nodust.bin"
+    {
+        printf '%s  %s\n' "$(hash_one "$direct_dir/utxo_chunks_index_nodust.bin")" utxo_chunks_index_nodust.bin
+        printf '%s  %s\n' "$(hash_one "$direct_dir/utxo_chunks_nodust.bin")" utxo_chunks_nodust.bin
+    } > "$direct_dir/direct-inputs.sha256"
+    chmod 0644 "$direct_dir/direct-inputs.sha256"
+
+    index_bytes=$(wc -c < "$direct_dir/utxo_chunks_index_nodust.bin" | tr -d ' ')
+    chunk_bytes=$(wc -c < "$direct_dir/utxo_chunks_nodust.bin" | tr -d ' ')
+    ((index_bytes > 0 && index_bytes % 25 == 0)) || fail "Direct ORAM index must contain 25-byte records"
+    ((chunk_bytes > 0 && chunk_bytes % 40 == 0)) || fail "Direct ORAM chunk must contain 40-byte records"
+    index_records=$((index_bytes / 25))
+    chunk_records=$((chunk_bytes / 40))
+
+    local manifest="$server_dir/MANIFEST.toml"
+    local tmp="$server_dir/.MANIFEST.toml.$$"
+    grep -qx '\[files\]' "$manifest" || fail "server DB manifest lacks [files] section"
+    awk \
+        -v index_sha256="$(hash_one "$direct_dir/utxo_chunks_index_nodust.bin")" \
+        -v index_bytes="$index_bytes" \
+        -v index_records="$index_records" \
+        -v chunk_sha256="$(hash_one "$direct_dir/utxo_chunks_nodust.bin")" \
+        -v chunk_bytes="$chunk_bytes" \
+        -v chunk_records="$chunk_records" \
+        -v index_slots_per_bin="$DIRECT_ORAM_INDEX_SLOTS_PER_BIN" \
+        -v index_hash_fns="$DIRECT_ORAM_INDEX_HASH_FNS" \
+        -v index_load_factor_ppb="$DIRECT_ORAM_INDEX_LOAD_FACTOR_PPB" \
+        -v index_seed="$DIRECT_ORAM_INDEX_SEED" '
+        /^\[files\]$/ {
+            print "[direct_oram]"
+            print "version = 1"
+            print "index_sha256 = \"" index_sha256 "\""
+            print "index_bytes = " index_bytes
+            print "index_records = " index_records
+            print "chunk_sha256 = \"" chunk_sha256 "\""
+            print "chunk_bytes = " chunk_bytes
+            print "chunk_records = " chunk_records
+            print "index_slots_per_bin = " index_slots_per_bin
+            print "index_hash_fns = " index_hash_fns
+            print "index_load_factor_ppb = " index_load_factor_ppb
+            print "index_seed = " index_seed
+            print ""
+        }
+        { print }
+    ' "$manifest" > "$tmp"
+    mv -f "$tmp" "$manifest"
+    chmod 0644 "$manifest"
+}
+
 diff_manifest_if_requested() {
     local label=$1
     local expected=${2:-}
@@ -418,6 +482,7 @@ if is_truthy "$ROOTS_ONLY"; then
     RUN_ONION_FFI=0
 fi
 WRITE_BUILD_EVIDENCE=${WRITE_BUILD_EVIDENCE:-1}
+BUILD_EVIDENCE_VERSION=${BUILD_EVIDENCE_VERSION:-1}
 BUILDER_GIT_COMMIT=${BUILDER_GIT_COMMIT:-$(current_git_commit)}
 TEE_PLATFORM=${TEE_PLATFORM:-none}
 TEE_IMAGE_MEASUREMENT=${TEE_IMAGE_MEASUREMENT:-none}
@@ -429,6 +494,22 @@ SERVER_DB_DIR=${SERVER_DB_DIR:-"$OUT_DIR/server-db"}
 [[ "$PARTITIONS" =~ ^[1-9][0-9]*$ ]] || fail "PARTITIONS must be positive"
 [[ "$ISSUED_AT" =~ ^-?[0-9]+$ ]] || fail "ISSUED_AT must be an integer"
 [[ "$PUSH_BATCH_ENTRIES" =~ ^[1-9][0-9]*$ ]] || fail "PUSH_BATCH_ENTRIES must be positive"
+[[ "$BUILD_EVIDENCE_VERSION" == "1" || "$BUILD_EVIDENCE_VERSION" == "2" ]] ||
+    fail "BUILD_EVIDENCE_VERSION must be 1 or 2"
+if [[ "$BUILD_EVIDENCE_VERSION" == "2" ]] && is_truthy "$ROOTS_ONLY"; then
+    fail "BUILD_EVIDENCE_VERSION=2 requires a full snapshot build, not ROOTS_ONLY=1"
+fi
+if [[ "$BUILD_EVIDENCE_VERSION" == "2" ]] && ! is_truthy "$RUN_ONION_FFI"; then
+    fail "BUILD_EVIDENCE_VERSION=2 requires RUN_ONION_FFI=1 for the final scanner-verified server layout"
+fi
+DIRECT_ORAM_INDEX_SLOTS_PER_BIN=${DIRECT_ORAM_INDEX_SLOTS_PER_BIN:-4}
+DIRECT_ORAM_INDEX_HASH_FNS=${DIRECT_ORAM_INDEX_HASH_FNS:-2}
+DIRECT_ORAM_INDEX_LOAD_FACTOR_PPB=${DIRECT_ORAM_INDEX_LOAD_FACTOR_PPB:-950000000}
+DIRECT_ORAM_INDEX_SEED=${DIRECT_ORAM_INDEX_SEED:-8030603977422561841}
+[[ "$DIRECT_ORAM_INDEX_SLOTS_PER_BIN" =~ ^[1-9][0-9]*$ ]] || fail "DIRECT_ORAM_INDEX_SLOTS_PER_BIN must be positive"
+[[ "$DIRECT_ORAM_INDEX_HASH_FNS" =~ ^[1-9][0-9]*$ ]] || fail "DIRECT_ORAM_INDEX_HASH_FNS must be positive"
+[[ "$DIRECT_ORAM_INDEX_LOAD_FACTOR_PPB" =~ ^[1-9][0-9]*$ ]] || fail "DIRECT_ORAM_INDEX_LOAD_FACTOR_PPB must be positive"
+[[ "$DIRECT_ORAM_INDEX_SEED" =~ ^[0-9]+$ ]] || fail "DIRECT_ORAM_INDEX_SEED must be an integer"
 
 ensure_empty_or_absent_dir "$OUT_DIR"
 LOG_DIR="$OUT_DIR/logs"
@@ -448,6 +529,7 @@ ENV_FILE="$OUT_DIR/build.env"
     printf 'issued_at=%s\n' "$ISSUED_AT"
     printf 'run_onion_ffi=%s\n' "$RUN_ONION_FFI"
     printf 'roots_only=%s\n' "$ROOTS_ONLY"
+    printf 'build_evidence_version=%s\n' "$BUILD_EVIDENCE_VERSION"
     printf 'builder_git_commit=%s\n' "$BUILDER_GIT_COMMIT"
     printf 'tee_platform=%s\n' "$TEE_PLATFORM"
     printf 'tee_image_measurement=%s\n' "$TEE_IMAGE_MEASUREMENT"
@@ -594,8 +676,25 @@ chunk_bins=$(kv "$LOG_DIR/04-build-chunk-cuckoo.out" "bins_per_table")
 [[ -n "$index_bins" ]] || fail "could not parse index bins from 03-build-index-cuckoo.out"
 [[ -n "$chunk_bins" ]] || fail "could not parse chunk bins from 04-build-chunk-cuckoo.out"
 
+if [[ "$BUILD_EVIDENCE_VERSION" == "2" ]]; then
+    is_truthy "$STAGE_SERVER_DB" || fail "BUILD_EVIDENCE_VERSION=2 requires STAGE_SERVER_DB=1"
+    stage_server_db "$OUT_DIR" "$SERVER_DB_DIR"
+    stage_direct_oram_inputs "$OUT_DIR" "$SERVER_DB_DIR"
+    printf 'server_db_dir=%s\n' "$SERVER_DB_DIR" | tee -a "$SUMMARY"
+    printf 'server_db_manifest=%s\n' "$SERVER_DB_DIR/MANIFEST.toml" | tee -a "$SUMMARY"
+    printf 'server_db_manifest_sha256=%s\n' "$(hash_one "$SERVER_DB_DIR/MANIFEST.toml")" | tee -a "$SUMMARY"
+    printf 'direct_oram_inputs=%s\n' "$OUT_DIR/oram-direct-inputs" | tee -a "$SUMMARY"
+fi
+
+ROOT_PAYLOAD_COMMAND=build-root-bundle-payload
+EVIDENCE_COMMAND=write-build-evidence
+if [[ "$BUILD_EVIDENCE_VERSION" == "2" ]]; then
+    ROOT_PAYLOAD_COMMAND=build-root-bundle-payload-v2
+    EVIDENCE_COMMAND=write-build-evidence-v2
+fi
+
 run_step 11-build-root-bundle-payload \
-    "$BIN" build-root-bundle-payload \
+    "$BIN" "$ROOT_PAYLOAD_COMMAND" \
     "$OUT_DIR" \
     "$NETWORK_MAGIC" \
     "$OUT_DIR/chain_anchor.bin" \
@@ -648,7 +747,7 @@ if is_truthy "$WRITE_RECEIPT"; then
         "$OUT_DIR/build-receipt.txt"
 fi
 
-if is_truthy "$STAGE_SERVER_DB"; then
+if [[ "$BUILD_EVIDENCE_VERSION" == "1" ]] && is_truthy "$STAGE_SERVER_DB"; then
     stage_server_db "$OUT_DIR" "$SERVER_DB_DIR"
     printf 'server_db_dir=%s\n' "$SERVER_DB_DIR" | tee -a "$SUMMARY"
     printf 'server_db_manifest=%s\n' "$SERVER_DB_DIR/MANIFEST.toml" | tee -a "$SUMMARY"
@@ -683,7 +782,7 @@ diff_manifest_if_requested \
 
 if is_truthy "$WRITE_BUILD_EVIDENCE"; then
     run_step 15-write-build-evidence \
-        "$BIN" write-build-evidence \
+        "$BIN" "$EVIDENCE_COMMAND" \
         "$OUT_DIR" \
         "$SNAPSHOT" \
         "$CORE_VERSION" \
