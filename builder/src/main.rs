@@ -75,6 +75,12 @@ fn main() -> ExitCode {
                 &args[10], &args[11],
             )
         }
+        Some("build-delta-root-bundle-payload-v2") if args.len() == 12 => {
+            root_payload::build_delta_root_bundle_payload_v2(
+                &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
+                &args[10], &args[11],
+            )
+        }
         Some("write-build-receipt") if args.len() == 6 => {
             receipt::write_build_receipt(&args[2], &args[3], &args[4], &args[5])
         }
@@ -84,6 +90,11 @@ fn main() -> ExitCode {
         Some("write-build-evidence-v2") if args.len() == 10 => evidence::write_build_evidence_v2(
             &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
         ),
+        Some("write-delta-build-evidence-v2") if args.len() == 10 => {
+            evidence::write_delta_build_evidence_v2(
+                &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
+            )
+        }
         Some("attest-existing-layout") if args.len() == 10 => evidence::attest_existing_layout(
             &args[2], &args[3], &args[4], &args[5], &args[6], &args[7], &args[8], &args[9],
         ),
@@ -259,9 +270,11 @@ fn usage(bin: &str) {
   {bin} build-root-bundle-payload <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} build-root-bundle-payload-v2 <out-dir> <network-magic-hex> <chain_anchor.bin> <muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} build-delta-root-bundle-payload <out-dir> <network-magic-hex> <delta_anchor.bin> <from-muhash-display-hex> <to-muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
+  {bin} build-delta-root-bundle-payload-v2 <out-dir> <network-magic-hex> <delta_anchor.bin> <from-muhash-display-hex> <to-muhash-display-hex> <index-bins-per-table> <chunk-bins-per-table> <onion-entry-size> <issued-at-unix> <out-payload.bin>\n\
   {bin} write-build-receipt <signed-root-bundle.bin> <snapshot.dat> <core-version> <out-receipt.txt>\n\
   {bin} write-build-evidence <out-dir> <snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
   {bin} write-build-evidence-v2 <out-dir> <snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
+  {bin} write-delta-build-evidence-v2 <out-dir> <to-snapshot.dat> <core-version> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <out-evidence.bin>\n\
   {bin} attest-existing-layout <v1-proof-dir> <artifact-dir> <builder-git-commit> <builder-bin> <tee-platform> <tee-image-measurement-hex-or-none> <issued-at-unix> <out-v2-proof-dir>\n\
   {bin} inspect-build-evidence <build-evidence.bin>\n\
   {bin} verify-build-evidence <build-evidence.bin> [--snapshot <snapshot.dat>] [--builder-bin <path>] [--payload <root-bundle-payload.bin>] [--database-manifest <path>] [--all-artifacts-manifest <path>] [--server-db-manifest <path>] [--expected-muhash <hex>] [--expected-anchor-height <height>] [--expected-anchor-hash <hex>] [--expected-report-data <64-byte-hex>] [--sev-snp-report <report.bin>]\n\

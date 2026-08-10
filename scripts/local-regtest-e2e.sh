@@ -302,6 +302,134 @@ if SNAPSHOT="$FIXTURE" \
 fi
 grep -q 'BUILD_EVIDENCE_VERSION=2 requires a full snapshot build' "$LOG_DIR/rejected-roots-only-v2.out"
 
+# Derive a second, syntactically valid regtest snapshot deterministically from
+# the committed fixture. The builder recomputes its MuHash below; this keeps a
+# non-empty delta fixture local to the E2E rather than committing generated
+# chain data.
+DELTA_TO_SNAPSHOT="$WORK/txoutset_regtest_112-derived.dat"
+node - "$FIXTURE" "$DELTA_TO_SNAPSHOT" <<'NODE'
+const fs = require('fs');
+const [from, to] = process.argv.slice(2);
+const data = fs.readFileSync(from);
+if (data.length < 84) throw new Error('snapshot is too short');
+data[11] ^= 0x5a; // Base block hash: derive a distinct test-only anchor.
+data[51] ^= 0xa5; // First outpoint txid: force a deterministic spent/created delta.
+fs.writeFileSync(to, data);
+NODE
+
+DELTA_TO_MUHASH=$(run_builder compute-muhash "$DELTA_TO_SNAPSHOT" | awk -F= '$1 == "muhash" {print $2}')
+DELTA_TO_ANCHOR_HASH=$(run_builder compute-muhash "$DELTA_TO_SNAPSHOT" | awk -F= '$1 == "base_hash" {print $2}')
+[[ "$DELTA_TO_MUHASH" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'error: derived snapshot did not produce a MuHash\n' >&2
+    exit 1
+}
+[[ "$DELTA_TO_MUHASH" != "$EXPECTED_MUHASH" ]] || {
+    printf 'error: derived snapshot MuHash must differ from from snapshot\n' >&2
+    exit 1
+}
+[[ "$DELTA_TO_ANCHOR_HASH" != "4e4003e955a41b187ad32e26fc837a98ca284df84ca3bbea19e6d164b3ebb3e7" ]] || {
+    printf 'error: derived snapshot anchor must differ from from snapshot\n' >&2
+    exit 1
+}
+
+DELTA_DIR="$WORK/full-build-v2-delta"
+FROM_SNAPSHOT="$FIXTURE" \
+FROM_EXPECTED_MUHASH="$EXPECTED_MUHASH" \
+FROM_ANCHOR_HEIGHT="$ANCHOR_HEIGHT" \
+TO_SNAPSHOT="$DELTA_TO_SNAPSHOT" \
+TO_EXPECTED_MUHASH="$DELTA_TO_MUHASH" \
+TO_ANCHOR_HEIGHT="$((ANCHOR_HEIGHT + 1))" \
+NETWORK_MAGIC="$NETWORK_MAGIC" \
+CORE_VERSION="$CORE_VERSION" \
+ONION_ENTRY_SIZE="$ONION_ENTRY_SIZE" \
+ISSUED_AT="$ISSUED_AT" \
+OUT_DIR="$DELTA_DIR" \
+BIN="$BIN" \
+SKIP_CARGO_BUILD=1 \
+RUN_ONION_FFI=1 \
+ONIONFFI_BIN="$ONIONFFI_BIN" \
+WRITE_RECEIPT=0 \
+EMIT_SEV_SNP_QUOTE=0 \
+ROOTS_ONLY=0 \
+BUILD_EVIDENCE_VERSION=2 \
+"$REPO_ROOT/scripts/build-delta-database.sh" > "$LOG_DIR/full-build-v2-delta.out"
+
+for rel in \
+    root-bundle-payload.bin \
+    build-evidence.bin \
+    build-evidence.report-data \
+    database.manifest.sha256 \
+    all-artifacts.manifest.sha256 \
+    server-db/MANIFEST.toml \
+    oram-direct-inputs/utxo_chunks_index_nodust.bin \
+    oram-direct-inputs/utxo_chunks_nodust.bin \
+    oram-direct-inputs/direct-inputs.sha256; do
+    [[ -s "$DELTA_DIR/$rel" ]] || {
+        printf 'error: native full-build v2 delta missing staging artifact: %s\n' "$rel" >&2
+        exit 1
+    }
+done
+
+DELTA_PAYLOAD_LOG="$DELTA_DIR/logs/13-build-delta-root-bundle-payload.out"
+DELTA_EVIDENCE_LOG="$DELTA_DIR/logs/17-write-build-evidence.out"
+grep -qx 'build_kind=delta' "$DELTA_PAYLOAD_LOG"
+grep -qx "from_anchor_height=$ANCHOR_HEIGHT" "$DELTA_PAYLOAD_LOG"
+grep -qx "anchor_height=$((ANCHOR_HEIGHT + 1))" "$DELTA_PAYLOAD_LOG"
+grep -qx "muhash=$DELTA_TO_MUHASH" "$DELTA_PAYLOAD_LOG"
+FROM_MUHASH_INTERNAL=$(node -e 'process.stdout.write(Buffer.from(process.argv[1], "hex").reverse().toString("hex"))' "$EXPECTED_MUHASH")
+grep -qx "root:input/from-utxo-muhash=$FROM_MUHASH_INTERNAL" "$DELTA_PAYLOAD_LOG"
+grep -qx 'evidence_version=2' "$DELTA_EVIDENCE_LOG"
+grep -qx 'build_kind=delta' "$DELTA_EVIDENCE_LOG"
+grep -qx 'evidence_mode=full_build' "$DELTA_EVIDENCE_LOG"
+grep -qx 'predecessor_evidence_sha256=none' "$DELTA_EVIDENCE_LOG"
+grep -qx 'predecessor_report_sha256=none' "$DELTA_EVIDENCE_LOG"
+
+delta_index_hash=$(hash_one "$DELTA_DIR/oram-direct-inputs/utxo_chunks_index_nodust.bin")
+delta_chunk_hash=$(hash_one "$DELTA_DIR/oram-direct-inputs/utxo_chunks_nodust.bin")
+delta_index_records=$(($(wc -c < "$DELTA_DIR/oram-direct-inputs/utxo_chunks_index_nodust.bin") / 25))
+delta_chunk_records=$(($(wc -c < "$DELTA_DIR/oram-direct-inputs/utxo_chunks_nodust.bin") / 40))
+((delta_index_records > 0 && delta_chunk_records > 0)) || {
+    printf 'error: derived delta must produce non-empty Direct ORAM inputs\n' >&2
+    exit 1
+}
+grep -qx "$delta_index_hash  utxo_chunks_index_nodust.bin" "$DELTA_DIR/oram-direct-inputs/direct-inputs.sha256"
+grep -qx "$delta_chunk_hash  utxo_chunks_nodust.bin" "$DELTA_DIR/oram-direct-inputs/direct-inputs.sha256"
+grep -qx "index_sha256 = \"$delta_index_hash\"" "$DELTA_DIR/server-db/MANIFEST.toml"
+grep -qx "chunk_sha256 = \"$delta_chunk_hash\"" "$DELTA_DIR/server-db/MANIFEST.toml"
+grep -qx "index_records = $delta_index_records" "$DELTA_DIR/server-db/MANIFEST.toml"
+grep -qx "chunk_records = $delta_chunk_records" "$DELTA_DIR/server-db/MANIFEST.toml"
+
+run_builder verify-build-evidence \
+    "$DELTA_DIR/build-evidence.bin" \
+    --snapshot "$DELTA_TO_SNAPSHOT" \
+    --builder-bin "$BIN" \
+    --payload "$DELTA_DIR/root-bundle-payload.bin" \
+    --database-manifest "$DELTA_DIR/database.manifest.sha256" \
+    --all-artifacts-manifest "$DELTA_DIR/all-artifacts.manifest.sha256" \
+    --server-db-manifest "$DELTA_DIR/server-db/MANIFEST.toml" \
+    --expected-muhash "$DELTA_TO_MUHASH" \
+    --expected-anchor-height "$((ANCHOR_HEIGHT + 1))" \
+    --expected-anchor-hash "$DELTA_TO_ANCHOR_HASH" \
+    > "$LOG_DIR/full-build-v2-delta.verify-evidence.out"
+
+if FROM_SNAPSHOT="$FIXTURE" \
+    FROM_EXPECTED_MUHASH="$EXPECTED_MUHASH" \
+    FROM_ANCHOR_HEIGHT="$ANCHOR_HEIGHT" \
+    TO_SNAPSHOT="$DELTA_TO_SNAPSHOT" \
+    TO_EXPECTED_MUHASH="$DELTA_TO_MUHASH" \
+    TO_ANCHOR_HEIGHT="$((ANCHOR_HEIGHT + 1))" \
+    NETWORK_MAGIC="$NETWORK_MAGIC" \
+    OUT_DIR="$WORK/rejected-delta-roots-only-v2" \
+    BIN="$BIN" \
+    SKIP_CARGO_BUILD=1 \
+    ROOTS_ONLY=1 \
+    BUILD_EVIDENCE_VERSION=2 \
+    "$REPO_ROOT/scripts/build-delta-database.sh" > "$LOG_DIR/rejected-delta-roots-only-v2.out" 2>&1; then
+    printf 'error: roots-only delta mode must not claim native full-build v2 evidence\n' >&2
+    exit 1
+fi
+grep -q 'BUILD_EVIDENCE_VERSION=2 requires a full delta build' "$LOG_DIR/rejected-delta-roots-only-v2.out"
+
 printf 'status=ok\n'
 printf 'fixture=%s\n' "$FIXTURE"
 printf 'muhash=%s\n' "$EXPECTED_MUHASH"
@@ -314,3 +442,4 @@ printf 'bundle_sha256=%s\n' "$bundle_sha256"
 printf 'receipt_sha256=%s\n' "$receipt_sha256"
 printf 'manifest_sha256=%s\n' "$manifest_sha256"
 printf 'native_full_build_v2=%s\n' "$V2_DIR"
+printf 'native_full_build_v2_delta=%s\n' "$DELTA_DIR"
