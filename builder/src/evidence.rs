@@ -379,6 +379,53 @@ pub fn write_build_evidence_v2(
     tee_image_measurement_hex_or_none: &str,
     out_evidence: &str,
 ) -> ExitCode {
+    write_full_build_evidence_v2(
+        out_dir,
+        snapshot,
+        core_version,
+        builder_git_commit,
+        builder_binary,
+        tee_platform,
+        tee_image_measurement_hex_or_none,
+        out_evidence,
+        rootbundle::BuildKind::Snapshot,
+    )
+}
+
+pub fn write_delta_build_evidence_v2(
+    out_dir: &str,
+    to_snapshot: &str,
+    core_version: &str,
+    builder_git_commit: &str,
+    builder_binary: &str,
+    tee_platform: &str,
+    tee_image_measurement_hex_or_none: &str,
+    out_evidence: &str,
+) -> ExitCode {
+    write_full_build_evidence_v2(
+        out_dir,
+        to_snapshot,
+        core_version,
+        builder_git_commit,
+        builder_binary,
+        tee_platform,
+        tee_image_measurement_hex_or_none,
+        out_evidence,
+        rootbundle::BuildKind::Delta,
+    )
+}
+
+fn write_full_build_evidence_v2(
+    out_dir: &str,
+    snapshot: &str,
+    core_version: &str,
+    builder_git_commit: &str,
+    builder_binary: &str,
+    tee_platform: &str,
+    tee_image_measurement_hex_or_none: &str,
+    out_evidence: &str,
+    expected_build_kind: rootbundle::BuildKind,
+) -> ExitCode {
     let result = (|| {
         let out_dir = Path::new(out_dir);
         let snapshot = Path::new(snapshot);
@@ -389,8 +436,12 @@ pub fn write_build_evidence_v2(
             .map_err(|e| format!("failed to read {}: {e}", payload_path.display()))?;
         let payload = rootbundle::RootBundlePayload::decode(&payload_bytes)
             .map_err(|e| format!("failed to decode {}: {e}", payload_path.display()))?;
-        if payload.build_kind != rootbundle::BuildKind::Snapshot {
-            return Err("full-build v2 evidence only supports snapshot payloads".into());
+        if payload.build_kind != expected_build_kind {
+            return Err(format!(
+                "full-build v2 evidence expected {}, got {}",
+                build_kind_label(expected_build_kind),
+                build_kind_label(payload.build_kind)
+            ));
         }
 
         let layout = dbpipeline::inspect_existing_onion_layout_v2(out_dir)
@@ -438,6 +489,8 @@ pub fn write_build_evidence_v2(
                 layout_fields.onion_entry_size, layout.entry_size
             ));
         }
+        verify_layout_anchor_and_seeds(&layout_fields, &layout)
+            .map_err(|e| format!("final Onion anchor/seed check failed: {e}"))?;
         let params = rootbundle::BuildParamsV2::current_snapshot(
             layout_fields.index_bins_per_table,
             layout_fields.chunk_bins_per_table,
