@@ -300,6 +300,96 @@ pub fn build_root_bundle_payload(
     }
 }
 
+/// Build a snapshot root payload using the final, scanner-verified Onion v2
+/// layout.  This is deliberately a separate command from the v1 builder so
+/// roots-only and existing v1 production paths keep their byte-level format.
+pub fn build_root_bundle_payload_v2(
+    out_dir: &str,
+    network_magic_hex: &str,
+    chain_anchor_path: &str,
+    muhash_display_hex: &str,
+    index_bins_per_table: &str,
+    chunk_bins_per_table: &str,
+    onion_entry_size: &str,
+    issued_at: &str,
+    out_payload: &str,
+) -> ExitCode {
+    let result = (|| {
+        let network_magic = parse_hex_array::<4>(network_magic_hex, "network-magic-hex")?;
+        let chain_anchor = rootbundle::ChainAnchor::load(chain_anchor_path)
+            .map_err(|e| format!("failed to read chain anchor {chain_anchor_path}: {e}"))?;
+        let index_bins_per_table = parse_u32_arg(index_bins_per_table, "index-bins-per-table")?;
+        let chunk_bins_per_table = parse_u32_arg(chunk_bins_per_table, "chunk-bins-per-table")?;
+        let onion_entry_size = parse_u32_arg(onion_entry_size, "onion-entry-size")?;
+        let issued_at = parse_i64_arg(issued_at, "issued-at-unix")?;
+        let out_dir = Path::new(out_dir);
+        let layout = dbpipeline::inspect_existing_onion_layout_v2(out_dir)
+            .map_err(|e| format!("final Onion layout check failed: {e}"))?;
+        if layout.entry_size != onion_entry_size {
+            return Err(format!(
+                "onion entry size mismatch: requested {onion_entry_size}, scanner found {}",
+                layout.entry_size
+            ));
+        }
+        let mut payload = root_bundle_payload_from_dir(
+            out_dir,
+            network_magic,
+            rootbundle::BuildKind::Snapshot,
+            rootbundle::ChainAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
+            chain_anchor,
+            muhash_display_hex,
+            index_bins_per_table,
+            chunk_bins_per_table,
+            onion_entry_size,
+            issued_at,
+            Vec::new(),
+        )?;
+        let params = rootbundle::BuildParamsV2::current_snapshot(
+            index_bins_per_table,
+            chunk_bins_per_table,
+            layout.entry_size,
+            layout.total_packed_entries,
+            layout.index_bins_per_table,
+            layout.chunk_bins_per_table,
+        );
+        payload.params_hash = params.params_hash();
+        let (payload_bytes, payload_sha256) = write_payload_file(&payload, Path::new(out_payload))?;
+        Ok::<_, String>((payload, layout, payload_bytes, payload_sha256))
+    })();
+
+    match result {
+        Ok((payload, layout, payload_bytes, payload_sha256)) => {
+            println!("network_magic={}", hex::encode(payload.network_magic));
+            println!("anchor_height={}", payload.anchor.height);
+            println!(
+                "anchor_hash={}",
+                display_hash_hex(&payload.anchor.block_hash)
+            );
+            println!("muhash={muhash_display_hex}");
+            println!("params_hash={}", hex::encode(payload.params_hash));
+            println!("params_version=2");
+            println!("onion_total_packed_entries={}", layout.total_packed_entries);
+            println!("onion_index_bins_per_table={}", layout.index_bins_per_table);
+            println!("onion_chunk_bins_per_table={}", layout.chunk_bins_per_table);
+            println!("root_entries={}", payload.roots.len());
+            for root in &payload.roots {
+                println!("root:{}={}", root.label, hex::encode(root.root));
+            }
+            println!("payload_bytes={payload_bytes}");
+            println!("payload_sha256={}", hex::encode(payload_sha256));
+            println!("payload_path={out_payload}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 pub fn build_delta_root_bundle_payload(
     out_dir: &str,
     network_magic_hex: &str,

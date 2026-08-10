@@ -366,6 +366,175 @@ pub fn write_build_evidence(
     }
 }
 
+/// Emit evidence v2 for a database built in this invocation.  Unlike
+/// `attest-existing-layout`, this path has no predecessor and refuses a
+/// payload whose params hash was not produced from the scanned v2 layout.
+pub fn write_build_evidence_v2(
+    out_dir: &str,
+    snapshot: &str,
+    core_version: &str,
+    builder_git_commit: &str,
+    builder_binary: &str,
+    tee_platform: &str,
+    tee_image_measurement_hex_or_none: &str,
+    out_evidence: &str,
+) -> ExitCode {
+    let result = (|| {
+        let out_dir = Path::new(out_dir);
+        let snapshot = Path::new(snapshot);
+        let builder_binary = Path::new(builder_binary);
+        let out_evidence = Path::new(out_evidence);
+        let payload_path = out_dir.join("root-bundle-payload.bin");
+        let payload_bytes = fs::read(&payload_path)
+            .map_err(|e| format!("failed to read {}: {e}", payload_path.display()))?;
+        let payload = rootbundle::RootBundlePayload::decode(&payload_bytes)
+            .map_err(|e| format!("failed to decode {}: {e}", payload_path.display()))?;
+        if payload.build_kind != rootbundle::BuildKind::Snapshot {
+            return Err("full-build v2 evidence only supports snapshot payloads".into());
+        }
+
+        let layout = dbpipeline::inspect_existing_onion_layout_v2(out_dir)
+            .map_err(|e| format!("final Onion layout check failed: {e}"))?;
+        let layout_fields = BuildEvidence {
+            version: EVIDENCE_VERSION_V2,
+            builder_git_commit: String::new(),
+            builder_binary_sha256: [0u8; 32],
+            tee_platform: String::new(),
+            tee_image_measurement: Vec::new(),
+            core_version: String::new(),
+            snapshot_sha256: [0u8; 32],
+            snapshot_bytes: 0,
+            network_magic: payload.network_magic,
+            build_kind: payload.build_kind,
+            from_anchor: payload.from_anchor,
+            anchor: payload.anchor,
+            utxo_muhash: payload.utxo_muhash,
+            dust_threshold_sats: payload.dust_threshold_sats,
+            max_utxos_per_spk: payload.max_utxos_per_spk,
+            params_hash: [0u8; 32],
+            index_bins_per_table: 0,
+            chunk_bins_per_table: 0,
+            onion_entry_size: 0,
+            bucket_super_root: [0u8; 32],
+            onion_super_root: [0u8; 32],
+            root_bundle_payload_sha256: [0u8; 32],
+            signed_root_bundle_sha256: None,
+            database_manifest_sha256: [0u8; 32],
+            all_artifacts_manifest_sha256: [0u8; 32],
+            server_db_manifest_sha256: [0u8; 32],
+            evidence_mode: 0,
+            predecessor_evidence_sha256: None,
+            predecessor_report_sha256: None,
+            onion_layout_v2: Some(OnionLayoutV2 {
+                total_packed_entries: layout.total_packed_entries,
+                index_bins_per_table: layout.index_bins_per_table,
+                chunk_bins_per_table: layout.chunk_bins_per_table,
+            }),
+        }
+        .with_layout_from_summary(out_dir)?;
+        if layout_fields.onion_entry_size != layout.entry_size {
+            return Err(format!(
+                "build summary Onion entry size {} disagrees with scanner {}",
+                layout_fields.onion_entry_size, layout.entry_size
+            ));
+        }
+        let params = rootbundle::BuildParamsV2::current_snapshot(
+            layout_fields.index_bins_per_table,
+            layout_fields.chunk_bins_per_table,
+            layout.entry_size,
+            layout.total_packed_entries,
+            layout.index_bins_per_table,
+            layout.chunk_bins_per_table,
+        );
+        if payload.params_hash != params.params_hash() {
+            return Err(
+                "root-bundle payload does not contain the canonical full-build v2 params hash"
+                    .into(),
+            );
+        }
+
+        let (snapshot_sha256, snapshot_bytes) = sha256_file(snapshot)?;
+        let (builder_binary_sha256, _) = sha256_file(builder_binary)?;
+        let root_bundle_payload_sha256 = sha256_bytes(&payload_bytes);
+        let signed_root_bundle_sha256 =
+            optional_sha256_file(&out_dir.join("signed-root-bundle.bin"))?;
+        let database_manifest_sha256 = sha256_file_32(&out_dir.join("database.manifest.sha256"))?;
+        let all_artifacts_manifest_sha256 =
+            sha256_file_32(&out_dir.join("all-artifacts.manifest.sha256"))?;
+        let server_db_manifest_sha256 = sha256_file_32(&out_dir.join("server-db/MANIFEST.toml"))?;
+        let bucket_super_root = *payload
+            .root("merkle/bucket/super_root")
+            .ok_or("root-bundle payload missing merkle/bucket/super_root")?;
+        let onion_super_root = *payload
+            .root("merkle/onion/super_root")
+            .ok_or("root-bundle payload missing merkle/onion/super_root")?;
+        if onion_super_root != layout.onion_super_root {
+            return Err("root-bundle payload Onion root disagrees with scanner".into());
+        }
+        let evidence = BuildEvidence {
+            version: EVIDENCE_VERSION_V2,
+            builder_git_commit: builder_git_commit.to_owned(),
+            builder_binary_sha256,
+            tee_platform: tee_platform.to_owned(),
+            tee_image_measurement: parse_optional_hex_bytes(
+                tee_image_measurement_hex_or_none,
+                "tee-image-measurement-hex-or-none",
+            )?,
+            core_version: core_version.to_owned(),
+            snapshot_sha256,
+            snapshot_bytes,
+            network_magic: payload.network_magic,
+            build_kind: payload.build_kind,
+            from_anchor: payload.from_anchor,
+            anchor: payload.anchor,
+            utxo_muhash: payload.utxo_muhash,
+            dust_threshold_sats: payload.dust_threshold_sats,
+            max_utxos_per_spk: payload.max_utxos_per_spk,
+            params_hash: params.params_hash(),
+            index_bins_per_table: layout_fields.index_bins_per_table,
+            chunk_bins_per_table: layout_fields.chunk_bins_per_table,
+            onion_entry_size: layout.entry_size,
+            bucket_super_root,
+            onion_super_root,
+            root_bundle_payload_sha256,
+            signed_root_bundle_sha256,
+            database_manifest_sha256,
+            all_artifacts_manifest_sha256,
+            server_db_manifest_sha256,
+            evidence_mode: 0,
+            predecessor_evidence_sha256: None,
+            predecessor_report_sha256: None,
+            onion_layout_v2: Some(OnionLayoutV2 {
+                total_packed_entries: layout.total_packed_entries,
+                index_bins_per_table: layout.index_bins_per_table,
+                chunk_bins_per_table: layout.chunk_bins_per_table,
+            }),
+        };
+        let encoded = evidence.encode()?;
+        create_new_parent(out_evidence)?;
+        let mut writer = File::create_new(out_evidence)
+            .map_err(|e| format!("failed to create {}: {e}", out_evidence.display()))?;
+        writer
+            .write_all(&encoded)
+            .map_err(|e| format!("failed to write {}: {e}", out_evidence.display()))?;
+        writer
+            .flush()
+            .map_err(|e| format!("failed to flush {}: {e}", out_evidence.display()))?;
+        Ok::<_, String>(evidence)
+    })();
+
+    match result {
+        Ok(evidence) => {
+            print_evidence_report(&evidence, Some(out_evidence));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// Re-seal a completed v1 artifact set as proof v2 without rebuilding the
 /// database. The checker scans the final Onion tables and Merkle material;
 /// only after those checks pass does it emit a new payload and evidence file.
