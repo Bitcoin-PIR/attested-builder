@@ -1,8 +1,5 @@
-# Standalone workspace — deliberately NOT a member of the repo-root
-# workspace. This directory is designed to be extracted into its own
-# repository (see PLAN.md §6) with `git mv` / `git filter-repo`; until
-# then it builds independently against the repo's vendored sources
-# (the root .cargo/config.toml source replacement applies here too).
+# Standalone workspace. Current scope is README.md; PLAN.md is a frozen
+# 2026-06 design note. This repository is already Bitcoin-PIR/attested-builder.
 
 [workspace]
 resolver = "2"

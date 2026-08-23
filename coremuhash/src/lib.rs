@@ -2,7 +2,7 @@
 //! `gettxoutsetinfo muhash` (`src/crypto/muhash.{h,cpp}`), reimplemented
 //! bit-compatibly in Rust.
 //!
-//! The attested builder (see ../PLAN.md) ingests a `dumptxoutset`
+//! The attested builder (see ../README.md) ingests a `dumptxoutset`
 //! snapshot, recomputes this hash over every coin, and refuses to build
 //! the PIR database unless it matches the muhash pinned for the chain
 //! anchor. Bit-compatibility with Core is the entire point: the pinned
