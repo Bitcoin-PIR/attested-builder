@@ -1,7 +1,15 @@
-# Attested Builder — Execution Plan
+# Attested Builder — Execution Plan (frozen 2026-06-12)
 
-Status: Phase 0 started 2026-06-12 (this directory). Owner decision log
-at the bottom.
+**Not current.** This file is the original design note (k-of-n Ed25519
+root bundles, Nitro/TDX, client strict mode). What the repo actually
+produces, and what it deliberately does not, is in [README.md](README.md).
+
+Do not treat Phase 2–4 below as a backlog that means a backend is
+unattested. Production trust is BuildEvidence v2 + SEV-SNP report-data
+binding, consumed by BitcoinPIR pin tables.
+
+Status when written: Phase 0 started 2026-06-12. Owner decision log at
+the bottom.
 
 ## Goal
 

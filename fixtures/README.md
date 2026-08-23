@@ -1,9 +1,13 @@
 # attested-builder fixtures
 
-Golden data for Phase 1 (`utxosnapshot` parser + muhash verification).
-Produced 2026-06-12 against the owner's Bitcoin node. All values below
-are exact strings copied from `bitcoin-cli` output — the end-to-end
-golden test must reproduce the muhash **display hex** byte-for-byte.
+Golden data for `utxosnapshot` parser + muhash verification. Produced
+2026-06-12 against the owner's Bitcoin node. All values below are exact
+strings copied from `bitcoin-cli` output — the end-to-end golden test
+must reproduce the muhash **display hex** byte-for-byte.
+
+Current producer scope is the repo [README](../README.md). Live
+BitcoinPIR pins stay in that repository's `web/src/attest-pin.ts`; the
+mainnet tables below are snapshot metadata, not a pin catalog.
 
 Core version for both fixtures: **Bitcoin Core v31.0.0**
 (`getnetworkinfo` version `310000`, subversion `/Satoshi:31.0.0/`;
@@ -66,8 +70,7 @@ case 1 (p2sh), and the raw-script fallback (p2wpkh, p2tr), plus
 amount compression across many magnitudes and VARINT heights/coinbase
 flags. NOT covered: P2PK cases 2–5 (no P2PK outputs here) — the
 `utxosnapshot` unit tests should take those from Core's
-`compress_tests.cpp` vectors as PLAN.md Phase 1 step 1 already calls
-for.
+`compress_tests.cpp` vectors.
 
 Note: the fixture is **recipe-reproducible, not byte-reproducible** —
 wallet keys, txids and the muhash differ on every regeneration. The
@@ -75,10 +78,11 @@ committed `.dat` + the strings above are the canonical golden pair.
 
 ---
 
-## 2. Mainnet production snapshots (metadata only — files stay on SSD)
+## 2. Mainnet snapshots captured 2026-06 (metadata only — files stay on SSD)
 
-These are the full and delta anchors used by the deployed production
-databases:
+These are the `940611` / `948454` Core snapshot records used by the
+retained BitcoinPIR lineage. They are not an instruction to rebuild
+that lineage.
 
 - full snapshot: height `948454`
 - delta snapshot range: `940611 -> 948454`
@@ -156,7 +160,7 @@ plus/minus delta -> Merkle roots/root bundle".
 
 ---
 
-## 3. gen_1_onion dust/whale counts (PLAN.md node-task 4)
+## 3. gen_1_onion dust/whale counts (historical sizing, 2026-06-12)
 
 Re-run 2026-06-12 with `gen_1_onion --data-dir <fresh dir>` (binary
 from this branch; OnionPIR entry size 3328 B, 4 partitions) against

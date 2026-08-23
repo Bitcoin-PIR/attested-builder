@@ -1,13 +1,13 @@
 //! Canonical signed root bundle.
 //!
-//! The bundle is the single client-facing trust artifact of the attested
-//! builder design (see ../PLAN.md): it binds the PIR database Merkle
-//! roots to a chain anchor (block hash + height), the Bitcoin Core
-//! `muhash` of the UTXO set the database was built from, and every
-//! build parameter that affects the output bytes. Builders (plain
-//! hosts, Nitro enclaves, SEV guests) each sign the identical canonical
-//! payload; clients accept a database root iff at least `threshold`
-//! signatures from distinct pinned builder keys verify.
+//! Canonical payload that binds PIR Merkle roots to a chain anchor,
+//! the Bitcoin Core `muhash` of the source UTXO set, and every
+//! build parameter that affects output bytes.
+//!
+//! Production trust is BuildEvidence v2 plus an optional SEV-SNP
+//! report (see the repo README). The Ed25519 k-of-n wrapper remains
+//! available; BitcoinPIR clients pin evidence hashes rather than a
+//! builder-key quorum. The 2026-06 design note is PLAN.md.
 //!
 //! Encoding follows the same hand-rolled, length-prefixed, canonical
 //! style as `pir-identity` (no serde): one and only one byte string per

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Deterministic local end-to-end smoke for the tiny committed regtest fixture.
 #
-# This is intentionally a plain-host test. It exercises the same trust chain
-# the TEE builder must run later:
-#   snapshot -> muhash gate -> flat UTXO set -> deterministic DB artifacts
-#   -> root bundle payload -> fixed-key signature -> quorum verify -> receipt.
+# This is intentionally a plain-host smoke. It exercises the same
+# snapshot -> muhash gate -> deterministic DB artifacts -> root payload
+# chain as a native full-build, then a test-only Ed25519 wrap. Production
+# TEE trust is BuildEvidence v2 + SEV-SNP, not this test key.
 
 set -euo pipefail
 
