@@ -5,6 +5,9 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "ffi")]
+mod data_ntt;
+
 pub const SIBLING_ROWS_INDEX_MAGIC: u64 = 0xBA7C_0E52_0000_0000;
 pub const SIBLING_ROWS_DATA_MAGIC: u64 = 0xBA7C_0E52_0000_0001;
 pub const SIBLING_DB_INDEX_MAGIC: u64 = 0xBA7C_0E51_0000_0000;
@@ -257,6 +260,7 @@ pub struct SiblingDbReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataNttOptions {
+    /// Maximum entries per FFI batch; internally capped to bound memory.
     pub push_batch_entries: usize,
 }
 
@@ -424,80 +428,12 @@ pub fn preprocess_data_ntt_file(
         )));
     }
 
-    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, File::open(input)?);
-    let mut server = onionpir::Server::new(input_entries);
-    let poly_degree = p.poly_degree as usize;
-    let mut entry_id = 0u64;
-    while entry_id < input_entries {
-        let remaining = (input_entries - entry_id) as usize;
-        let n_this_batch = options.push_batch_entries.min(remaining);
-        let mut raw = vec![0u8; n_this_batch * entry_size];
-        reader.read_exact(&mut raw)?;
-
-        let mut batch_coeffs = Vec::with_capacity(n_this_batch * poly_degree);
-        for entry in raw.chunks_exact(entry_size) {
-            let coeffs = pack_bytes_into_coefficients(entry, entry_size, poly_degree);
-            batch_coeffs.extend_from_slice(&coeffs);
-        }
-        if !server.push_plaintexts(&batch_coeffs, n_this_batch as u64, entry_id, &[]) {
-            return Err(Error::FfiFailed("push_plaintexts"));
-        }
-        entry_id += n_this_batch as u64;
-    }
-
-    let temp = temp_save_path_near(output)?;
-    let temp_str = temp.to_string_lossy();
-    if !server.save_db(&temp_str) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::FfiFailed("save_db"));
-    }
-
     let expected_payload = p
         .coeff_val_cnt
         .checked_mul(p.num_plaintexts)
         .and_then(|n| n.checked_mul(8))
         .ok_or(Error::IntegerOverflow("data NTT payload length"))?;
-    let temp_bytes = std::fs::metadata(&temp)?.len();
-    let expected_temp_bytes = ONION_SAVE_DB_HEADER_SIZE as u64 + expected_payload;
-    if temp_bytes != expected_temp_bytes {
-        let _ = std::fs::remove_file(&temp);
-        return Err(Error::InvalidOnionShape(format!(
-            "save_db size mismatch: expected {} bytes, got {}",
-            expected_temp_bytes, temp_bytes
-        )));
-    }
-
-    let mut raw_save = File::open(&temp)?;
-    raw_save.seek(SeekFrom::Start(ONION_SAVE_DB_HEADER_SIZE as u64))?;
-    let output_file = match File::create_new(output) {
-        Ok(file) => file,
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::Io(e));
-        }
-    };
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
-    let copied = match std::io::copy(&mut raw_save, &mut writer) {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp);
-            let _ = std::fs::remove_file(output);
-            return Err(Error::Io(e));
-        }
-    };
-    if let Err(e) = writer.flush() {
-        let _ = std::fs::remove_file(&temp);
-        let _ = std::fs::remove_file(output);
-        return Err(Error::Io(e));
-    }
-    let _ = std::fs::remove_file(&temp);
-    if copied != expected_payload {
-        let _ = std::fs::remove_file(output);
-        return Err(Error::InvalidOnionShape(format!(
-            "copied payload size mismatch: expected {}, got {}",
-            expected_payload, copied
-        )));
-    }
+    data_ntt::write(input, output, options, &p, input_entries, expected_payload)?;
 
     Ok(DataNttReport {
         input_entries,

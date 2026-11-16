@@ -7,7 +7,7 @@
 //! writing.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -15,6 +15,12 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+
+mod bucket_merkle;
+mod cuckoo;
+mod delta;
+mod external_sort;
+mod grouping;
 
 pub const FLAT_UTXO_ENTRY_SIZE: usize = utxosnapshot::FLAT_UTXO_ENTRY_SIZE as usize;
 pub const SCRIPT_HASH_SIZE: usize = 20;
@@ -624,31 +630,6 @@ struct ShortenedEntry {
     height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct OutPointKey {
-    txid: [u8; TXID_SIZE],
-    vout: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SpentRef {
-    txid: [u8; TXID_SIZE],
-    vout: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct NewUtxo {
-    txid: [u8; TXID_SIZE],
-    vout: u32,
-    amount: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ScriptDelta {
-    spent: Vec<SpentRef>,
-    new_utxos: Vec<NewUtxo>,
-}
-
 type TopEntry = (usize, [u8; SCRIPT_HASH_SIZE], [u8; TXID_SIZE], u32);
 
 #[derive(Debug, Clone)]
@@ -942,12 +923,7 @@ pub fn build_grouped_delta_from_flat_sets(
         return Err(PipelineError::OutputExists(tmp));
     }
 
-    let result = build_grouped_delta_from_flat_sets_inner(
-        from_flat_utxo_path,
-        to_flat_utxo_path,
-        &tmp,
-        options,
-    );
+    let result = delta::build(from_flat_utxo_path, to_flat_utxo_path, &tmp, options);
 
     match result {
         Ok(report) => {
@@ -1056,7 +1032,7 @@ pub fn build_index_cuckoo(
         return Err(PipelineError::OutputExists(tmp_path));
     }
 
-    let result = build_index_cuckoo_inner(index_path, &tmp_path, options);
+    let result = cuckoo::build_index(index_path, &tmp_path, options);
     match result {
         Ok(report) => {
             std::fs::rename(&tmp_path, output_path)?;
@@ -1087,7 +1063,7 @@ pub fn build_chunk_cuckoo(
         return Err(PipelineError::OutputExists(tmp_path));
     }
 
-    let result = build_chunk_cuckoo_inner(chunks_path, &tmp_path, options);
+    let result = cuckoo::build_chunks(chunks_path, &tmp_path, options);
     match result {
         Ok(report) => {
             std::fs::rename(&tmp_path, output_path)?;
@@ -1124,43 +1100,27 @@ pub fn build_bucket_merkle_with_options(
     let out_dir = out_dir.as_ref();
     std::fs::create_dir_all(out_dir)?;
 
-    let index_data = std::fs::read(index_cuckoo_path)?;
-    let chunk_data = std::fs::read(chunk_cuckoo_path)?;
-    let index_meta = parse_cuckoo_meta(
+    let mut index = bucket_merkle::Input::open(
         index_cuckoo_path,
-        &index_data,
         INDEX_CUCKOO_MAGIC,
         INDEX_CUCKOO_HEADER_SIZE,
         INDEX_K,
         INDEX_SLOTS_PER_BIN,
         INDEX_PBC_HASHES,
+        INDEX_SLOT_SIZE,
     )?;
-    let chunk_meta = parse_cuckoo_meta(
+    let mut chunk = bucket_merkle::Input::open(
         chunk_cuckoo_path,
-        &chunk_data,
         CHUNK_CUCKOO_MAGIC,
         CHUNK_CUCKOO_HEADER_SIZE,
         CHUNK_K,
         CHUNK_SLOTS_PER_BIN,
         CHUNK_PBC_HASHES,
-    )?;
-    validate_cuckoo_body(
-        index_cuckoo_path,
-        index_data.len(),
-        &index_meta,
-        INDEX_K,
-        INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE,
-    )?;
-    validate_cuckoo_body(
-        chunk_cuckoo_path,
-        chunk_data.len(),
-        &chunk_meta,
-        CHUNK_K,
-        CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE,
+        CHUNK_SLOT_SIZE,
     )?;
 
-    let index_sibling_levels = compute_sibling_levels(index_meta.bins_per_table);
-    let chunk_sibling_levels = compute_sibling_levels(chunk_meta.bins_per_table);
+    let index_sibling_levels = compute_sibling_levels(index.meta.bins_per_table);
+    let chunk_sibling_levels = compute_sibling_levels(chunk.meta.bins_per_table);
     let mut output_paths = vec![out_dir.join(MERKLE_BUCKET_ROOT_FILENAME)];
     if !options.root_only {
         output_paths.push(out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
@@ -1182,11 +1142,9 @@ pub fn build_bucket_merkle_with_options(
         }
     }
 
-    let result = build_bucket_merkle_inner(
-        &index_data,
-        &chunk_data,
-        &index_meta,
-        &chunk_meta,
+    let result = bucket_merkle::build(
+        &mut index,
+        &mut chunk,
         out_dir,
         &index_sibling_levels,
         &chunk_sibling_levels,
@@ -1209,7 +1167,9 @@ pub fn build_bucket_merkle_with_options(
     }
 }
 
-fn build_index_cuckoo_inner(
+// Full-memory references retained for differential tests of group spooling.
+#[cfg(test)]
+fn build_index_cuckoo_legacy(
     index_path: &Path,
     output_path: &Path,
     options: &IndexCuckooOptions,
@@ -1317,7 +1277,8 @@ fn build_index_cuckoo_table(
     Ok(table)
 }
 
-fn build_chunk_cuckoo_inner(
+#[cfg(test)]
+fn build_chunk_cuckoo_legacy(
     chunks_path: &Path,
     output_path: &Path,
     options: &ChunkCuckooOptions,
@@ -1413,109 +1374,6 @@ fn build_chunk_cuckoo_table(
     Ok(table)
 }
 
-fn build_bucket_merkle_inner(
-    index_data: &[u8],
-    chunk_data: &[u8],
-    index_meta: &CuckooTableMeta,
-    chunk_meta: &CuckooTableMeta,
-    out_dir: &Path,
-    index_sibling_levels: &[usize],
-    chunk_sibling_levels: &[usize],
-    options: &BucketMerkleOptions,
-) -> Result<BucketMerkleBuildReport, PipelineError> {
-    let index_bin_size = INDEX_SLOTS_PER_BIN * INDEX_SLOT_SIZE;
-    let chunk_bin_size = CHUNK_SLOTS_PER_BIN * CHUNK_SLOT_SIZE;
-
-    let index_trees: Vec<PerGroupTree> = (0..INDEX_K)
-        .map(|group_id| {
-            build_group_tree(
-                index_data,
-                index_meta.header_size,
-                group_id,
-                index_meta.bins_per_table,
-                index_bin_size,
-            )
-        })
-        .collect();
-    let chunk_trees: Vec<PerGroupTree> = (0..CHUNK_K)
-        .map(|group_id| {
-            build_group_tree(
-                chunk_data,
-                chunk_meta.header_size,
-                group_id,
-                chunk_meta.bins_per_table,
-                chunk_bin_size,
-            )
-        })
-        .collect();
-
-    let tree_tops_file_bytes = if options.root_only {
-        0
-    } else {
-        for (level_idx, &num_groups) in index_sibling_levels.iter().enumerate() {
-            write_flat_sibling_table(
-                &temp_path(&out_dir.join(merkle_index_sibling_filename(level_idx))),
-                &index_trees,
-                level_idx,
-                num_groups,
-                INDEX_K,
-                bucket_sib_magic(0, level_idx as u8),
-            )?;
-        }
-        for (level_idx, &num_groups) in chunk_sibling_levels.iter().enumerate() {
-            write_flat_sibling_table(
-                &temp_path(&out_dir.join(merkle_chunk_sibling_filename(level_idx))),
-                &chunk_trees,
-                level_idx,
-                num_groups,
-                CHUNK_K,
-                bucket_sib_magic(1, level_idx as u8),
-            )?;
-        }
-
-        let tree_tops_path = temp_path(&out_dir.join(MERKLE_BUCKET_TREE_TOPS_FILENAME));
-        write_tree_tops(
-            &tree_tops_path,
-            &index_trees,
-            &chunk_trees,
-            index_sibling_levels,
-            chunk_sibling_levels,
-        )?;
-        std::fs::metadata(&tree_tops_path)?.len()
-    };
-
-    let mut roots = Vec::with_capacity(INDEX_K + CHUNK_K);
-    roots.extend(index_trees.iter().map(|tree| tree.root));
-    roots.extend(chunk_trees.iter().map(|tree| tree.root));
-
-    let roots_file_bytes = if options.root_only {
-        0
-    } else {
-        let roots_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOTS_FILENAME));
-        write_roots(&roots_path, &roots)?;
-        std::fs::metadata(&roots_path)?.len()
-    };
-
-    let mut super_preimage = Vec::with_capacity(roots.len() * MERKLE_HASH_SIZE);
-    for root in &roots {
-        super_preimage.extend_from_slice(root);
-    }
-    let super_root = sha256(&super_preimage);
-    let super_root_path = temp_path(&out_dir.join(MERKLE_BUCKET_ROOT_FILENAME));
-    std::fs::write(&super_root_path, super_root)?;
-
-    Ok(BucketMerkleBuildReport {
-        index_bins_per_table: index_meta.bins_per_table as u32,
-        chunk_bins_per_table: chunk_meta.bins_per_table as u32,
-        index_sibling_levels: index_sibling_levels.iter().map(|&n| n as u32).collect(),
-        chunk_sibling_levels: chunk_sibling_levels.iter().map(|&n| n as u32).collect(),
-        tree_count: (INDEX_K + CHUNK_K) as u32,
-        tree_tops_file_bytes,
-        roots_file_bytes,
-        super_root,
-    })
-}
-
 fn parse_cuckoo_meta(
     path: &Path,
     data: &[u8],
@@ -1608,46 +1466,6 @@ fn validate_cuckoo_body(
     Ok(())
 }
 
-fn build_group_tree(
-    table_data: &[u8],
-    data_offset: usize,
-    group_id: usize,
-    bins_per_table: usize,
-    bin_size: usize,
-) -> PerGroupTree {
-    let table_byte_size = bins_per_table * bin_size;
-    let group_offset = data_offset + group_id * table_byte_size;
-    let group_data = &table_data[group_offset..group_offset + table_byte_size];
-
-    let mut levels = Vec::new();
-    let leaves: Vec<Hash256> = (0..bins_per_table)
-        .map(|i| {
-            let bin_start = i * bin_size;
-            compute_bin_leaf_hash(i as u32, &group_data[bin_start..bin_start + bin_size])
-        })
-        .collect();
-    levels.push(leaves);
-
-    loop {
-        let prev = levels.last().unwrap();
-        if prev.len() <= 1 {
-            break;
-        }
-        let mut next = Vec::with_capacity(prev.len().div_ceil(MERKLE_ARITY));
-        for i in 0..prev.len().div_ceil(MERKLE_ARITY) {
-            let start = i * MERKLE_ARITY;
-            let end = (start + MERKLE_ARITY).min(prev.len());
-            let mut children = prev[start..end].to_vec();
-            children.resize(MERKLE_ARITY, ZERO_HASH);
-            next.push(compute_parent_n(&children));
-        }
-        levels.push(next);
-    }
-
-    let root = levels.last().unwrap()[0];
-    PerGroupTree { levels, root }
-}
-
 fn compute_sibling_levels(bins_per_table: usize) -> Vec<usize> {
     let mut levels = Vec::new();
     let mut nodes_at_level = bins_per_table;
@@ -1660,59 +1478,6 @@ fn compute_sibling_levels(bins_per_table: usize) -> Vec<usize> {
         nodes_at_level = num_groups;
     }
     levels
-}
-
-fn write_flat_sibling_table(
-    path: &Path,
-    trees: &[PerGroupTree],
-    level_idx: usize,
-    num_groups: usize,
-    k: usize,
-    magic: u64,
-) -> Result<(), PipelineError> {
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, File::create_new(path)?);
-    writer.write_all(&magic.to_le_bytes())?;
-    writer.write_all(&(k as u32).to_le_bytes())?;
-    writer.write_all(&1u32.to_le_bytes())?;
-    writer.write_all(&(num_groups as u32).to_le_bytes())?;
-    writer.write_all(&0u32.to_le_bytes())?;
-    writer.write_all(&0u64.to_le_bytes())?;
-
-    for tree in trees.iter().take(k) {
-        let children_level = &tree.levels[level_idx];
-        for row in 0..num_groups {
-            let start = row * MERKLE_ARITY;
-            for child in 0..MERKLE_ARITY {
-                let idx = start + child;
-                if idx < children_level.len() {
-                    writer.write_all(&children_level[idx])?;
-                } else {
-                    writer.write_all(&ZERO_HASH)?;
-                }
-            }
-        }
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn write_tree_tops(
-    path: &Path,
-    index_trees: &[PerGroupTree],
-    chunk_trees: &[PerGroupTree],
-    index_sibling_levels: &[usize],
-    chunk_sibling_levels: &[usize],
-) -> Result<(), PipelineError> {
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(path)?);
-    writer.write_all(&((index_trees.len() + chunk_trees.len()) as u32).to_le_bytes())?;
-    for tree in index_trees {
-        write_one_tree_top(&mut writer, tree, index_sibling_levels.len())?;
-    }
-    for tree in chunk_trees {
-        write_one_tree_top(&mut writer, tree, chunk_sibling_levels.len())?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 fn write_one_tree_top<W: Write>(
@@ -1810,38 +1575,17 @@ fn build_utxo_chunks_inner(
     let mut whale_entries: Vec<([u8; SCRIPT_HASH_SIZE], usize)> = Vec::new();
     let mut top_heap: BinaryHeap<Reverse<TopEntry>> = BinaryHeap::new();
 
-    for partition in 0..options.partitions {
-        let mut map: HashMap<[u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>> = HashMap::new();
-        for entry in FlatEntryIter::open(flat_utxo_path)? {
-            let entry = entry?;
-            if entry.script_hash[0] as usize % options.partitions != partition {
-                continue;
-            }
-            if entry.amount <= options.dust_threshold_sats {
-                report.dust_utxos_skipped += 1;
-                continue;
-            }
-            map.entry(entry.script_hash)
-                .or_default()
-                .push(ShortenedEntry {
-                    txid: entry.txid,
-                    vout: entry.vout,
-                    amount: entry.amount,
-                    height: entry.height,
-                });
-        }
-
-        let mut groups: Vec<([u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>)> =
-            map.into_iter().collect();
-        groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        for (script_hash, mut entries) in groups {
-            if entries.len() > options.max_utxos_per_spk {
+    let dust_skipped = grouping::visit(
+        flat_utxo_path,
+        chunks_path,
+        options,
+        |script_hash, count, mut entries| {
+            if count > options.max_utxos_per_spk {
                 write_index_entry(&mut index_writer, &script_hash, 0, 0)?;
-                whale_entries.push((script_hash, entries.len()));
+                whale_entries.push((script_hash, count));
                 report.whale_spks_excluded += 1;
                 report.index_entries += 1;
-                continue;
+                return Ok(());
             }
 
             entries.sort_unstable_by(|a, b| b.height.cmp(&a.height));
@@ -1885,8 +1629,10 @@ fn build_utxo_chunks_inner(
             report.chunks_written += num_chunks as u64;
             report.data_bytes += data_len as u64;
             report.padding_bytes += padding as u64;
-        }
-    }
+            Ok(())
+        },
+    )?;
+    report.dust_utxos_skipped = dust_skipped;
 
     chunks_writer.flush()?;
     index_writer.flush()?;
@@ -1928,36 +1674,20 @@ fn build_onion_pack_inner(
         max_serialized_len: 0,
     };
 
-    for partition in 0..options.partitions {
-        let mut map: HashMap<[u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>> = HashMap::new();
-        for entry in FlatEntryIter::open(flat_utxo_path)? {
-            let entry = entry?;
-            if entry.script_hash[0] as usize % options.partitions != partition {
-                continue;
-            }
-            if entry.amount <= options.dust_threshold_sats {
-                report.dust_utxos_skipped += 1;
-                continue;
-            }
-            map.entry(entry.script_hash)
-                .or_default()
-                .push(ShortenedEntry {
-                    txid: entry.txid,
-                    vout: entry.vout,
-                    amount: entry.amount,
-                    height: entry.height,
-                });
-        }
-
-        let mut groups: Vec<([u8; SCRIPT_HASH_SIZE], Vec<ShortenedEntry>)> =
-            map.into_iter().collect();
-        groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-        for (script_hash, mut entries) in groups {
-            if entries.len() > options.max_utxos_per_spk {
+    let group_options = UtxoChunkBuildOptions {
+        partitions: options.partitions,
+        dust_threshold_sats: options.dust_threshold_sats,
+        max_utxos_per_spk: options.max_utxos_per_spk,
+    };
+    let dust_skipped = grouping::visit(
+        flat_utxo_path,
+        packed_path,
+        &group_options,
+        |script_hash, count, mut entries| {
+            if count > options.max_utxos_per_spk {
                 write_onion_index_entry(&mut index_writer, &script_hash, 0, 0, ONION_WHALE_FLAG)?;
                 report.whale_spks_excluded += 1;
-                continue;
+                return Ok(());
             }
 
             entries.sort_unstable_by(|a, b| b.height.cmp(&a.height));
@@ -1972,8 +1702,10 @@ fn build_onion_pack_inner(
                 num_entries,
             )?;
             report.groups_packed += 1;
-        }
-    }
+            Ok(())
+        },
+    )?;
+    report.dust_utxos_skipped = dust_skipped;
 
     packer.finish()?;
     index_writer.flush()?;
@@ -1986,132 +1718,6 @@ fn build_onion_pack_inner(
     report.padding_bytes = packer.total_padding;
 
     Ok(report)
-}
-
-fn build_grouped_delta_from_flat_sets_inner(
-    from_flat_utxo_path: &Path,
-    to_flat_utxo_path: &Path,
-    grouped_delta_path: &Path,
-    options: &DeltaBuildOptions,
-) -> Result<DeltaBuildReport, PipelineError> {
-    let from_bytes = std::fs::metadata(from_flat_utxo_path)?.len();
-    if from_bytes % FLAT_UTXO_ENTRY_SIZE as u64 != 0 {
-        return Err(PipelineError::InvalidFlatUtxoSize { bytes: from_bytes });
-    }
-    let to_bytes = std::fs::metadata(to_flat_utxo_path)?.len();
-    if to_bytes % FLAT_UTXO_ENTRY_SIZE as u64 != 0 {
-        return Err(PipelineError::InvalidFlatUtxoSize { bytes: to_bytes });
-    }
-    let from_entries = from_bytes / FLAT_UTXO_ENTRY_SIZE as u64;
-    let to_entries = to_bytes / FLAT_UTXO_ENTRY_SIZE as u64;
-
-    let mut from_map: HashMap<OutPointKey, [u8; SCRIPT_HASH_SIZE]> =
-        HashMap::with_capacity(from_entries as usize);
-    for entry in FlatEntryIter::open(from_flat_utxo_path)? {
-        let entry = entry?;
-        let key = OutPointKey {
-            txid: entry.txid,
-            vout: entry.vout,
-        };
-        if from_map.insert(key, entry.script_hash).is_some() {
-            return Err(PipelineError::InvalidDeltaFormat {
-                path: from_flat_utxo_path.to_path_buf(),
-                reason: format!("duplicate outpoint {}:{}", hex::encode(key.txid), key.vout),
-            });
-        }
-    }
-
-    let mut deltas: HashMap<[u8; SCRIPT_HASH_SIZE], ScriptDelta> = HashMap::new();
-    let mut unchanged_entries = 0u64;
-    let mut created_entries = 0u64;
-    let mut dust_created_skipped = 0u64;
-
-    for entry in FlatEntryIter::open(to_flat_utxo_path)? {
-        let entry = entry?;
-        let key = OutPointKey {
-            txid: entry.txid,
-            vout: entry.vout,
-        };
-        if from_map.remove(&key).is_some() {
-            unchanged_entries += 1;
-            continue;
-        }
-        if entry.amount <= options.dust_threshold_sats {
-            dust_created_skipped += 1;
-            continue;
-        }
-        deltas
-            .entry(entry.script_hash)
-            .or_default()
-            .new_utxos
-            .push(NewUtxo {
-                txid: entry.txid,
-                vout: entry.vout,
-                amount: entry.amount,
-            });
-        created_entries += 1;
-    }
-
-    let spent_entries = from_map.len() as u64;
-    let mut spent: Vec<(OutPointKey, [u8; SCRIPT_HASH_SIZE])> = from_map.into_iter().collect();
-    spent.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    for (key, script_hash) in spent {
-        deltas.entry(script_hash).or_default().spent.push(SpentRef {
-            txid: key.txid,
-            vout: key.vout,
-        });
-    }
-
-    let mut delta_groups: Vec<_> = deltas.into_iter().collect();
-    delta_groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    for (_script_hash, delta) in &mut delta_groups {
-        delta
-            .spent
-            .sort_unstable_by(|a, b| a.txid.cmp(&b.txid).then_with(|| a.vout.cmp(&b.vout)));
-        delta.new_utxos.sort_unstable_by(|a, b| {
-            a.txid
-                .cmp(&b.txid)
-                .then_with(|| a.vout.cmp(&b.vout))
-                .then_with(|| a.amount.cmp(&b.amount))
-        });
-    }
-
-    let mut writer =
-        BufWriter::with_capacity(4 * 1024 * 1024, File::create_new(grouped_delta_path)?);
-    if delta_groups.len() > u32::MAX as usize {
-        return Err(PipelineError::InvalidDeltaFormat {
-            path: grouped_delta_path.to_path_buf(),
-            reason: format!("too many changed scripts: {}", delta_groups.len()),
-        });
-    }
-    writer.write_all(&(delta_groups.len() as u32).to_le_bytes())?;
-    for (script_hash, delta) in &delta_groups {
-        writer.write_all(script_hash)?;
-        write_varint_to_writer(&mut writer, delta.spent.len() as u64)?;
-        for spent in &delta.spent {
-            writer.write_all(&spent.txid)?;
-            write_varint_to_writer(&mut writer, spent.vout as u64)?;
-        }
-        write_varint_to_writer(&mut writer, delta.new_utxos.len() as u64)?;
-        for new_utxo in &delta.new_utxos {
-            writer.write_all(&new_utxo.txid)?;
-            write_varint_to_writer(&mut writer, new_utxo.vout as u64)?;
-            write_varint_to_writer(&mut writer, new_utxo.amount)?;
-        }
-    }
-    writer.flush()?;
-    let grouped_file_bytes = std::fs::metadata(grouped_delta_path)?.len();
-
-    Ok(DeltaBuildReport {
-        from_entries,
-        to_entries,
-        unchanged_entries,
-        spent_entries,
-        created_entries,
-        dust_created_skipped,
-        scripts_changed: delta_groups.len() as u64,
-        grouped_file_bytes,
-    })
 }
 
 fn build_delta_chunks_inner(
@@ -2881,8 +2487,8 @@ fn inspect_preprocessed_onion_sibling_entry_size(dir: &Path) -> Result<u32, Pipe
         if actual_magic != magic
             || actual_k != k
             || arity == 0
-            || rows == 0
-            || blob_len < ONION_SAVE_DB_HEADER_SIZE as u32
+            || (rows == 0 && blob_len != 0)
+            || (rows != 0 && blob_len < ONION_SAVE_DB_HEADER_SIZE as u32)
             || file.metadata()?.len() != expected_len
         {
             return Err(PipelineError::InvalidExistingOnionLayout(format!(
@@ -2890,10 +2496,14 @@ fn inspect_preprocessed_onion_sibling_entry_size(dir: &Path) -> Result<u32, Pipe
                 path.display()
             )));
         }
-        for group in 0..actual_k as usize {
-            let offset = ONION_MERKLE_SIB_HEADER_SIZE as u64 + group as u64 * blob_len as u64;
-            let save = read_save_db_header(&file, offset, &path)?;
-            validate_save_db_header(&save, Some(rows as u64), blob_len as u64, &path)?;
+        // A single-bin tree has no sibling rows. onionffi encodes it as a
+        // header-only DB (rows=0, blob_len=0), with no per-group save headers.
+        if rows != 0 {
+            for group in 0..actual_k as usize {
+                let offset = ONION_MERKLE_SIB_HEADER_SIZE as u64 + group as u64 * blob_len as u64;
+                let save = read_save_db_header(&file, offset, &path)?;
+                validate_save_db_header(&save, Some(rows as u64), blob_len as u64, &path)?;
+            }
         }
         sizes.push(arity * MERKLE_HASH_SIZE as u32);
     }
@@ -3206,7 +2816,7 @@ fn verify_existing_index_leaf_hashes(
             }
             leaves.push(actual);
         }
-        roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
+        roots.push(build_merkle_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
     }
     ensure_reader_eof(&mut hashes, hashes_path)?;
     Ok(roots)
@@ -3269,7 +2879,7 @@ fn verify_existing_chunk_leaf_hashes(
             }
             leaves.push(actual);
         }
-        roots.push(build_onion_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
+        roots.push(build_merkle_group_tree(leaves, entry_size as usize / MERKLE_HASH_SIZE).root);
     }
     ensure_reader_eof(&mut hashes, hashes_path)?;
     Ok(roots)
@@ -3566,12 +3176,12 @@ fn build_onion_tree_kind(
     (0..k)
         .map(|group_id| {
             let start = group_id * bins_per_table;
-            build_onion_group_tree(hashes[start..start + bins_per_table].to_vec(), arity)
+            build_merkle_group_tree(hashes[start..start + bins_per_table].to_vec(), arity)
         })
         .collect()
 }
 
-fn build_onion_group_tree(leaf_hashes: Vec<Hash256>, arity: usize) -> PerGroupTree {
+fn build_merkle_group_tree(leaf_hashes: Vec<Hash256>, arity: usize) -> PerGroupTree {
     let mut levels = vec![leaf_hashes];
     loop {
         let prev = levels.last().unwrap();
@@ -5322,6 +4932,45 @@ mod tests {
             .join(MERKLE_BUCKET_ROOTS_FILENAME)
             .exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preprocessed_empty_sibling_db_requires_exact_header_only_format() {
+        let dir = fresh_temp_dir("empty-preprocessed-siblings");
+        for (name, magic, k) in [
+            (
+                ONION_MERKLE_SIB_INDEX_FILENAME,
+                ONION_MERKLE_SIB_INDEX_MAGIC,
+                INDEX_K,
+            ),
+            (
+                ONION_MERKLE_SIB_DATA_FILENAME,
+                ONION_MERKLE_SIB_DATA_MAGIC,
+                CHUNK_K,
+            ),
+        ] {
+            let mut header = magic.to_le_bytes().to_vec();
+            header.extend_from_slice(&(k as u32).to_le_bytes());
+            header.extend_from_slice(&104u32.to_le_bytes());
+            header.extend_from_slice(&0u32.to_le_bytes());
+            header.extend_from_slice(&0u32.to_le_bytes());
+            std::fs::write(dir.join(name), header).unwrap();
+        }
+        assert_eq!(
+            inspect_preprocessed_onion_sibling_entry_size(&dir).unwrap(),
+            3328
+        );
+        let path = dir.join(ONION_MERKLE_SIB_INDEX_FILENAME);
+        let valid = std::fs::read(&path).unwrap();
+        for (rows, blob_len, trailing) in [(0u32, 0u32, 1usize), (1, 0, 0), (0, 48, INDEX_K * 48)] {
+            let mut malformed = valid.clone();
+            malformed[16..20].copy_from_slice(&rows.to_le_bytes());
+            malformed[20..24].copy_from_slice(&blob_len.to_le_bytes());
+            malformed.resize(malformed.len() + trailing, 0);
+            std::fs::write(&path, malformed).unwrap();
+            assert!(inspect_preprocessed_onion_sibling_entry_size(&dir).is_err());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
