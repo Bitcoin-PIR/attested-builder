@@ -43,6 +43,9 @@
 #   TEE_IMAGE_MEASUREMENT Hex measurement bytes, or none. Default none.
 #   EMIT_SEV_SNP_QUOTE 1 to call /dev/sev-guest and write
 #                     build-evidence.sev-snp-report.bin. Default 0.
+#   PRUNE_INTERMEDIATES 1 to release reproducible intermediates after their
+#                     last consumer in a full build. Default 0. Records hashes
+#                     in pruned-intermediates.tsv; see rebuild script.
 #
 # Subcommands:
 #   stage-server-db <out-dir> [server-db-dir]
@@ -55,7 +58,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 usage() {
-    sed -n '1,47p' "$0" >&2
+    sed -n '1,50p' "$0" >&2
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -110,6 +113,33 @@ remove_roots_only_files() {
         if [[ -e "$path" ]]; then
             rm -f -- "$path"
         fi
+    done
+}
+
+# Only called for outputs of successful stages in this fresh OUT_DIR. Keep
+# the snapshot, Direct ORAM inputs, and raw Onion tables used by v2 scanners.
+prune_intermediates() {
+    if [[ "$PRUNE_INTERMEDIATES" != "1" ]] || is_truthy "$ROOTS_ONLY"; then
+        return
+    fi
+    local after=$1
+    shift
+    local name path bytes digest
+    for name in "$@"; do
+        case "$name" in
+            utxo_set.bin|onion_index.bin|merkle_onion_sib_rows_index.bin|merkle_onion_sib_rows_data.bin) ;;
+            *) fail "unsupported intermediate: $name" ;;
+        esac
+        path="$OUT_DIR/$name"
+        [[ -f "$path" && ! -L "$path" ]] || fail "intermediate is not a regular build output: $path"
+        bytes=$(wc -c < "$path" | tr -d ' ')
+        digest=$(hash_one "$path")
+        # Record before unlinking, so an interrupted build still has the hash
+        # needed to verify a regenerated file. Ledger entries may therefore
+        # describe a file that is still present after interruption.
+        printf '%s\t%s\t%s\t%s\n' "$name" "$bytes" "$digest" "$after" >> "$OUT_DIR/pruned-intermediates.tsv"
+        rm -- "$path"
+        printf 'pruned_intermediate=%s bytes=%s after=%s\n' "$name" "$bytes" "$after" | tee -a "$SUMMARY"
     done
 }
 
@@ -476,6 +506,7 @@ SKIP_CARGO_BUILD=${SKIP_CARGO_BUILD:-0}
 WRITE_RECEIPT=${WRITE_RECEIPT:-auto}
 PUSH_BATCH_ENTRIES=${PUSH_BATCH_ENTRIES:-256}
 ROOTS_ONLY=${ROOTS_ONLY:-0}
+PRUNE_INTERMEDIATES=${PRUNE_INTERMEDIATES:-0}
 STAGE_SERVER_DB=${STAGE_SERVER_DB:-1}
 if is_truthy "$ROOTS_ONLY"; then
     STAGE_SERVER_DB=0
@@ -494,6 +525,7 @@ SERVER_DB_DIR=${SERVER_DB_DIR:-"$OUT_DIR/server-db"}
 [[ "$PARTITIONS" =~ ^[1-9][0-9]*$ ]] || fail "PARTITIONS must be positive"
 [[ "$ISSUED_AT" =~ ^-?[0-9]+$ ]] || fail "ISSUED_AT must be an integer"
 [[ "$PUSH_BATCH_ENTRIES" =~ ^[1-9][0-9]*$ ]] || fail "PUSH_BATCH_ENTRIES must be positive"
+[[ "$PRUNE_INTERMEDIATES" == "0" || "$PRUNE_INTERMEDIATES" == "1" ]] || fail "PRUNE_INTERMEDIATES must be 0 or 1"
 [[ "$BUILD_EVIDENCE_VERSION" == "1" || "$BUILD_EVIDENCE_VERSION" == "2" ]] ||
     fail "BUILD_EVIDENCE_VERSION must be 1 or 2"
 if [[ "$BUILD_EVIDENCE_VERSION" == "2" ]] && is_truthy "$ROOTS_ONLY"; then
@@ -529,6 +561,7 @@ ENV_FILE="$OUT_DIR/build.env"
     printf 'issued_at=%s\n' "$ISSUED_AT"
     printf 'run_onion_ffi=%s\n' "$RUN_ONION_FFI"
     printf 'roots_only=%s\n' "$ROOTS_ONLY"
+    printf 'prune_intermediates=%s\n' "$PRUNE_INTERMEDIATES"
     printf 'build_evidence_version=%s\n' "$BUILD_EVIDENCE_VERSION"
     printf 'builder_git_commit=%s\n' "$BUILDER_GIT_COMMIT"
     printf 'tee_platform=%s\n' "$TEE_PLATFORM"
@@ -617,6 +650,7 @@ remove_roots_only_files \
 run_step 06-build-onion-pack \
     "$BIN" build-onion-pack "$OUT_DIR/utxo_set.bin" "$OUT_DIR" "$ONION_ENTRY_SIZE"
 
+prune_intermediates 06-build-onion-pack utxo_set.bin
 remove_roots_only_files "$OUT_DIR/utxo_set.bin"
 
 run_step 07-build-onion-data-cuckoo \
@@ -704,6 +738,15 @@ run_step 11-build-root-bundle-payload \
     "$ONION_ENTRY_SIZE" \
     "$ISSUED_AT" \
     "$OUT_DIR/root-bundle-payload.bin"
+
+# These hashes are part of the root payload. Releasing them earlier would
+# change its named roots. Raw packed entries/index bins stay for evidence's
+# full leaf-content scan, even though final serving files now also exist.
+prune_intermediates 11-build-root-bundle-payload onion_index.bin
+if is_truthy "$RUN_ONION_FFI"; then
+    prune_intermediates 11-build-root-bundle-payload \
+        merkle_onion_sib_rows_index.bin merkle_onion_sib_rows_data.bin
+fi
 
 if [[ -n "${BUILDER_KEY:-}" ]]; then
     [[ -f "$BUILDER_KEY" ]] || fail "BUILDER_KEY does not exist: $BUILDER_KEY"
